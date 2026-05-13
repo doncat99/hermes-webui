@@ -5,7 +5,6 @@ Extracted from server.py (Sprint 11) so server.py is a thin shell.
 
 import html as _html
 import copy
-import io
 import json
 import logging
 import os
@@ -23,6 +22,7 @@ import re
 from pathlib import Path
 from contextlib import closing
 from urllib.parse import parse_qs
+import yaml
 from api.agent_sessions import (
     MESSAGING_SOURCES,
     is_cli_session_row,
@@ -50,9 +50,6 @@ _CLIENT_DISCONNECT_ERRORS = (
 # Track job IDs currently being executed so the frontend can poll status.
 _RUNNING_CRON_JOBS: dict[str, float] = {}  # job_id → start_timestamp
 _RUNNING_CRON_LOCK = threading.Lock()
-_MANUAL_COMPRESSION_JOBS: dict[str, dict] = {}
-_MANUAL_COMPRESSION_JOBS_LOCK = threading.Lock()
-_MANUAL_COMPRESSION_JOB_TTL_SECONDS = 10 * 60
 _CRON_OUTPUT_CONTENT_LIMIT = 8000
 _CRON_OUTPUT_HEADER_CONTEXT = 200
 _MESSAGING_RAW_SOURCES = {str(s).strip().lower() for s in MESSAGING_SOURCES}
@@ -84,6 +81,143 @@ _STALE_MESSAGING_END_REASONS = {"session_reset", "session_switch"}
 # module keep resolving without per-call-site refactors.
 from api.profiles import _profiles_match  # noqa: F401, E402  (re-export)
 
+# ONTOSYNTH-PROFILE-SCOPE-BEGIN
+def _ontosynth_webui_profile_scope():
+    import json as _json
+    import os as _os
+    from pathlib import Path as _Path
+
+    candidate_paths = []
+    raw_path = _os.getenv("ONTOSYNTH_WEBUI_PROFILE_SCOPE_PATH", "").strip()
+    if raw_path:
+        candidate_paths.append(_Path(raw_path).expanduser())
+    try:
+        module_path = _Path(__file__).resolve()
+        for parent in module_path.parents:
+            candidate_paths.append(parent / ".ontosynth" / "webui_profile_scope.json")
+    except Exception:
+        pass
+    try:
+        cwd = _Path.cwd().resolve()
+        for parent in [cwd, *cwd.parents]:
+            candidate_paths.append(parent / ".ontosynth" / "webui_profile_scope.json")
+    except Exception:
+        pass
+
+    seen = set()
+    for path in candidate_paths:
+        path_key = str(path)
+        if path_key in seen:
+            continue
+        seen.add(path_key)
+        if not path.exists():
+            continue
+        try:
+            payload = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        profile_keys = payload.get("profile_keys") or []
+        if not isinstance(profile_keys, list):
+            continue
+        return payload
+    return None
+
+
+def _ontosynth_webui_scope_allows_name(name):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return True
+    allowed = {str(item) for item in payload.get("profile_keys", [])}
+    if str(name) in allowed:
+        return True
+    return bool(payload.get("include_default_profile")) and str(name) == "default"
+
+
+def _ontosynth_webui_default_active_profile():
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return None
+    profile_keys = payload.get("profile_keys") or []
+    if profile_keys:
+        return str(profile_keys[0])
+    if bool(payload.get("include_default_profile")):
+        return "default"
+    return None
+
+
+def _ontosynth_webui_scoped_profile_keys():
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return []
+    return [str(item) for item in payload.get("profile_keys", []) if str(item).strip()]
+
+
+def _ontosynth_webui_runtime_identity_for_profile(profile_key):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return None
+    for profile in payload.get("profiles", []) or []:
+        if not isinstance(profile, dict):
+            continue
+        if str(profile.get("hermes_profile_key") or "") == str(profile_key):
+            runtime_identity = str(profile.get("runtime_identity") or "").strip()
+            return runtime_identity or None
+    return None
+
+
+def _ontosynth_webui_profile_label(profile_key):
+    runtime_identity = _ontosynth_webui_runtime_identity_for_profile(profile_key)
+    if runtime_identity:
+        return runtime_identity.replace("-", " ").title()
+    return str(profile_key).replace("-", " ").title()
+
+
+def _ontosynth_webui_scope_profile_home(profile_key):
+    from pathlib import Path as _Path
+
+    base_home = _Path.home() / ".hermes"
+    try:
+        base_home = _DEFAULT_HERMES_HOME
+    except NameError:
+        pass
+    if str(profile_key) == "default":
+        return base_home
+    return base_home / "profiles" / str(profile_key)
+
+
+def filter_profiles_for_ontosynth_webui_scope(profiles):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return profiles
+    return [
+        profile
+        for profile in list(profiles or [])
+        if isinstance(profile, dict)
+        and _ontosynth_webui_scope_allows_name(profile.get("name"))
+    ]
+
+
+def filter_assignees_for_ontosynth_webui_scope(assignees):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return assignees
+    filtered = []
+    for assignee in list(assignees or []):
+        name = assignee.get("name") if isinstance(assignee, dict) else assignee
+        counts = assignee.get("counts") if isinstance(assignee, dict) else None
+        if _ontosynth_webui_scope_allows_name(name) or bool(counts):
+            filtered.append(assignee)
+    return filtered
+
+
+def _ontosynth_webui_row_matches_scope_profile(row_profile, active_profile):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return _profiles_match(row_profile, active_profile)
+    allowed = set(_ontosynth_webui_scoped_profile_keys())
+    row = str(row_profile or "default")
+    return row in allowed or (row == "default" and bool(payload.get("include_default_profile")))
+# ONTOSYNTH-PROFILE-SCOPE-END
 
 def _all_profiles_query_flag(parsed_url) -> bool:
     """Return True if the request URL has `?all_profiles=1` (or true/yes).
@@ -148,6 +282,286 @@ def _active_skill_search_dirs(skills_dir: Path) -> list[Path]:
     except Exception:
         pass
     return [p for p in dirs if p.exists()]
+
+
+def _ontosynth_workspace_root() -> Path | None:
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return None
+    raw_path = os.getenv("ONTOSYNTH_WEBUI_PROFILE_SCOPE_PATH", "").strip()
+    if raw_path:
+        path = Path(raw_path).expanduser()
+        if path.exists():
+            return path.resolve().parent.parent
+    for base in [Path(__file__).resolve(), Path.cwd().resolve()]:
+        for parent in [base.parent if base.is_file() else base, *(base.parents if base.is_file() else base.parents)]:
+            candidate = parent / ".ontosynth" / "webui_profile_scope.json"
+            if candidate.exists():
+                return candidate.resolve().parent.parent
+    return None
+
+
+def _collect_skill_index(skills_dir: Path) -> list[dict[str, object]]:
+    return list(_skills_list_from_dir(skills_dir).get("skills", []) or [])
+
+
+def _list_skill_dir_names(skills_dir: Path) -> list[str]:
+    names: list[str] = []
+    for skill in _collect_skill_index(skills_dir):
+        name = str(skill.get("name") or "").strip()
+        if name:
+            names.append(name)
+    return sorted(set(names))
+
+
+def _profile_verification_lookup(repo_root: Path, project_key: str) -> dict[str, dict[str, object]]:
+    path = (
+        repo_root
+        / "artifacts"
+        / "project_profiles"
+        / project_key
+        / "profile_verification.json"
+    )
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    result: dict[str, dict[str, object]] = {}
+    for row in payload.get("profiles", []) or []:
+        if not isinstance(row, dict):
+            continue
+        runtime_identity = str(row.get("runtime_identity") or "").strip()
+        if runtime_identity:
+            result[runtime_identity] = row
+    return result
+
+
+def _managed_skill_payload(managed_skills: object) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for skill in list(managed_skills or []):
+        if not isinstance(skill, dict):
+            continue
+        references = []
+        for reference in list(skill.get("references", []) or []):
+            if not isinstance(reference, dict):
+                continue
+            references.append(
+                {
+                    "path": str(reference.get("path") or ""),
+                    "title": str(reference.get("title") or ""),
+                    "when_to_load": str(reference.get("when_to_load") or ""),
+                    "content": str(reference.get("content") or ""),
+                }
+            )
+        result.append(
+            {
+                "skill_key": str(skill.get("skill_key") or ""),
+                "title": str(skill.get("title") or ""),
+                "when_to_use": str(skill.get("when_to_use") or ""),
+                "workflow": [str(item) for item in list(skill.get("workflow", []) or [])],
+                "deliverables": [
+                    str(item) for item in list(skill.get("deliverables", []) or [])
+                ],
+                "success_metrics": [
+                    str(item)
+                    for item in list(skill.get("success_metrics", []) or [])
+                ],
+                "references": references,
+            }
+        )
+    return result
+
+
+def _skill_view_payload_for_profile_home(profile_home: Path, skill_name: str) -> dict[str, object] | None:
+    skills_dir = profile_home / "skills"
+    if not skills_dir.exists():
+        return None
+    skill_dir, skill_md = _find_skill_in_dir(skill_name, skills_dir)
+    if not skill_dir or not skill_md:
+        return None
+    from tools.skills_tool import skill_view as _skill_view
+
+    target_name = str(skill_dir) if (skill_dir / "SKILL.md") == skill_md else str(skill_md)
+    raw = _skill_view(target_name)
+    data = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(data, dict):
+        return None
+    if not isinstance(data.get("linked_files"), dict):
+        data["linked_files"] = {}
+    return {
+        "skill_key": str(skill_name),
+        "name": str(data.get("name") or skill_name),
+        "description": str(data.get("description") or ""),
+        "content": str(data.get("content") or ""),
+        "linked_files": data.get("linked_files") or {},
+    }
+
+
+def _materialized_skill_details_for_profile_home(
+    profile_home: Path,
+    skill_names: list[str],
+) -> list[dict[str, object]]:
+    details: list[dict[str, object]] = []
+    for skill_name in skill_names:
+        detail = _skill_view_payload_for_profile_home(profile_home, skill_name)
+        if detail is not None:
+            details.append(detail)
+    return details
+
+
+def _build_ontosynth_skills_overview() -> dict[str, object]:
+    payload = _ontosynth_webui_profile_scope() or {}
+    project_key = str(payload.get("project_key") or "").strip()
+    repo_root = _ontosynth_workspace_root()
+    if not project_key or repo_root is None:
+        return {
+            "scope_active": False,
+            "project_key": project_key,
+            "platform_catalog": {"skill_count": 0, "skills": [], "source_roots": []},
+            "project_contract": {"role_count": 0, "roles": []},
+            "runtime_materialized": {"profile_count": 0, "profiles": []},
+        }
+
+    profile_specs_path = repo_root / "projects" / project_key / "runtime" / "profile_specs.yaml"
+    profile_specs_payload = yaml.safe_load(profile_specs_path.read_text(encoding="utf-8")) or {}
+    profile_specs = {
+        str(profile.get("runtime_identity") or "").strip(): profile
+        for profile in profile_specs_payload.get("profiles", []) or []
+        if isinstance(profile, dict) and str(profile.get("runtime_identity") or "").strip()
+    }
+
+    platform_skills_dir = _ontosynth_webui_scope_profile_home("default") / "skills"
+    platform_skills = _collect_skill_index(platform_skills_dir)
+    platform_catalog = {
+        "skill_count": len(platform_skills),
+        "skills": platform_skills,
+        "source_roots": [str(platform_skills_dir)],
+    }
+
+    contract_roles: list[dict[str, object]] = []
+    verification = _profile_verification_lookup(repo_root, project_key)
+    runtime_profiles: list[dict[str, object]] = []
+
+    for scoped in payload.get("profiles", []) or []:
+        if not isinstance(scoped, dict):
+            continue
+        profile_key = str(scoped.get("hermes_profile_key") or "").strip()
+        runtime_identity = str(scoped.get("runtime_identity") or "").strip()
+        if not profile_key or not runtime_identity:
+            continue
+        profile = profile_specs.get(runtime_identity, {})
+        session_preloaded = [
+            str(item)
+            for item in list(profile.get("session_preloaded_skill_keys", []) or [])
+            if str(item).strip()
+        ]
+        managed_skill_keys = [
+            str(skill.get("skill_key"))
+            for skill in list(profile.get("managed_skills", []) or [])
+            if isinstance(skill, dict) and str(skill.get("skill_key") or "").strip()
+        ]
+        managed_skills = _managed_skill_payload(profile.get("managed_skills", []))
+        bundled = [
+            str(item)
+            for item in list(profile.get("allowed_bundled_skills", []) or [])
+            if str(item).strip()
+        ]
+        contract_roles.append(
+            {
+                "profile_key": profile_key,
+                "runtime_identity": runtime_identity,
+                "display_name": str(profile.get("display_name") or runtime_identity),
+                "session_preloaded_skill_keys": session_preloaded,
+                "managed_skill_keys": managed_skill_keys,
+                "managed_skills": managed_skills,
+                "managed_skill_count": len(managed_skill_keys),
+                "allowed_bundled_skills": bundled,
+                "allowed_bundled_skill_count": len(bundled),
+            }
+        )
+
+        profile_home = _ontosynth_webui_scope_profile_home(profile_key)
+        profile_skills_dir = profile_home / "skills"
+        materialized = _list_skill_dir_names(profile_skills_dir) if profile_skills_dir.exists() else []
+        materialized_set = set(materialized)
+        materialized_skill_details = _materialized_skill_details_for_profile_home(
+            profile_home,
+            materialized,
+        )
+        materialized_skill_detail_by_key = {
+            str(item.get("skill_key") or ""): item for item in materialized_skill_details
+        }
+        preloaded_skill_details = [
+            materialized_skill_detail_by_key[skill_name]
+            for skill_name in session_preloaded
+            if skill_name in materialized_skill_detail_by_key
+        ]
+        verification_row = verification.get(runtime_identity, {})
+        runtime_profiles.append(
+            {
+                "profile_key": profile_key,
+                "runtime_identity": runtime_identity,
+                "display_name": str(profile.get("display_name") or runtime_identity),
+                "profile_home": str(profile_home),
+                "materialized_skill_names": materialized,
+                "materialized_skill_count": len(materialized),
+                "materialized_skill_details": materialized_skill_details,
+                "contract_preloaded_present": [
+                    name for name in session_preloaded if name in materialized_set
+                ],
+                "preloaded_skill_details": preloaded_skill_details,
+                "contract_managed_only_skill_keys": [
+                    name for name in managed_skill_keys if name not in materialized_set
+                ],
+                "contract_managed_only_skill_count": sum(
+                    1 for name in managed_skill_keys if name not in materialized_set
+                ),
+                "verification": {
+                    "ready": bool(verification_row.get("ready", False)),
+                    "actual_local_count": int(verification_row.get("actual_local_count", 0) or 0),
+                    "actual_builtin_count": int(
+                        verification_row.get("actual_builtin_count", 0) or 0
+                    ),
+                    "expected_local_count": int(
+                        verification_row.get("expected_local_count", 0) or 0
+                    ),
+                    "expected_builtin_count": int(
+                        verification_row.get("expected_builtin_count", 0) or 0
+                    ),
+                    "extra_skills": list(verification_row.get("extra_skills", []) or []),
+                    "missing_local_skills": list(
+                        verification_row.get("missing_local_skills", []) or []
+                    ),
+                    "missing_builtin_skills": list(
+                        verification_row.get("missing_builtin_skills", []) or []
+                    ),
+                },
+            }
+        )
+
+    return {
+        "scope_active": True,
+        "project_key": project_key,
+        "platform_catalog": platform_catalog,
+        "project_contract": {
+            "role_count": len(contract_roles),
+            "roles": contract_roles,
+            "source": str(profile_specs_path),
+        },
+        "runtime_materialized": {
+            "profile_count": len(runtime_profiles),
+            "profiles": runtime_profiles,
+            "source": str(
+                repo_root
+                / "artifacts"
+                / "project_profiles"
+                / project_key
+                / "profile_verification.json"
+            ),
+        },
+    }
 
 
 def _worktree_retained_payload(session) -> dict:
@@ -1928,15 +2342,6 @@ _LOGIN_LOCALE = {
         "invalid_pw": "Invalid password",
         "conn_failed": "Connection failed",
     },
-    "fr": {
-        "lang": "fr-FR",
-        "title": "Se connecter",
-        "subtitle": "Entrez votre mot de passe pour continuer",
-        "placeholder": "Mot de passe",
-        "btn": "Se connecter",
-        "invalid_pw": "Mot de passe invalide",
-        "conn_failed": "\u00c9chec de la connexion",
-    },
     "es": {
         "lang": "es-ES",
         "title": "Iniciar sesi\u00f3n",
@@ -3045,6 +3450,15 @@ def handle_get(handler, parsed) -> bool:
             from api.updates import AGENT_VERSION, WEBUI_VERSION
             settings["webui_version"] = WEBUI_VERSION
             settings["agent_version"] = AGENT_VERSION
+            settings["ontosynth_webui_patch"] = "profile-scope-v8"
+            settings["ontosynth_scope_active"] = bool(_ontosynth_webui_profile_scope())
+            settings["ontosynth_scope_path"] = os.getenv("ONTOSYNTH_WEBUI_PROFILE_SCOPE_PATH", "")
+            settings["ontosynth_default_panel"] = "kanban" if bool(_ontosynth_webui_profile_scope()) else ""
+            settings["ontosynth_default_kanban_board"] = (
+                "knowledge-governance"
+                if str((_ontosynth_webui_profile_scope() or {}).get("project_key") or "") == "knowledge_governance_console"
+                else ""
+            )
         except Exception:
             pass
         return j(handler, settings)
@@ -3084,10 +3498,6 @@ def handle_get(handler, parsed) -> bool:
         except Exception as exc:
             logger.exception("failed to read worktree status for session %s", sid)
             return bad(handler, _sanitize_error(exc), status=500)
-
-    if parsed.path == "/api/session/compress/status":
-        query = parse_qs(parsed.query)
-        return _handle_session_compress_status(handler, query.get("session_id", [""])[0])
 
     if parsed.path == "/api/session":
         import time as _time
@@ -3387,7 +3797,7 @@ def handle_get(handler, parsed) -> bool:
             webui_sessions = all_sessions(diag=diag)
             diag.stage("load_settings")
             settings = load_settings()
-            show_cli_sessions = bool(settings.get("show_cli_sessions"))
+            show_cli_sessions = bool(settings.get("show_cli_sessions")) or bool(_ontosynth_webui_scoped_profile_keys())
             if show_cli_sessions:
                 diag.stage("get_cli_sessions")
                 cli = get_cli_sessions()
@@ -3407,6 +3817,14 @@ def handle_get(handler, parsed) -> bool:
                                 s[key] = meta[key]
                 # Apply the same CLI visibility semantics to imported local copies so
                 # low-value imported artifacts do not leak into the sidebar.
+                webui_sessions = [
+                    s for s in webui_sessions
+                    if not (
+                        _ontosynth_webui_scoped_profile_keys()
+                        and str(s.get("profile") or "").startswith("os-")
+                        and s.get("session_id") not in cli_by_id
+                    )
+                ]
                 webui_sessions = [s for s in webui_sessions if is_cli_session_row_visible(s)]
                 webui_ids = {s["session_id"] for s in webui_sessions}
                 from api.models import _hide_from_default_sidebar as _cron_hide
@@ -3439,13 +3857,25 @@ def handle_get(handler, parsed) -> bool:
             from api.profiles import get_active_profile_name
             active_profile = get_active_profile_name()
             all_profiles = _all_profiles_query_flag(parsed)
+            if show_cli_sessions and _ontosynth_webui_scoped_profile_keys():
+                webui_sessions = [
+                    s for s in webui_sessions
+                    if _ontosynth_webui_row_matches_scope_profile(
+                        s.get("profile"), active_profile
+                    )
+                ]
+                merged = webui_sessions + deduped_cli
+                merged.sort(
+                    key=lambda s: s.get("last_message_at") or s.get("updated_at", 0) or 0,
+                    reverse=True,
+                )
             diag.stage("profile_filter")
             if all_profiles:
                 scoped = merged
                 other_profile_count = 0
             else:
                 scoped = [s for s in merged
-                          if _profiles_match(s.get("profile"), active_profile)]
+                          if _ontosynth_webui_row_matches_scope_profile(s.get("profile"), active_profile)]
                 other_profile_count = len(merged) - len(scoped)
             diag.stage("messaging_dedupe")
             scoped = _keep_latest_messaging_session_per_source(scoped)
@@ -3484,7 +3914,7 @@ def handle_get(handler, parsed) -> bool:
             scoped = all_projects
         else:
             scoped = [p for p in all_projects
-                      if _profiles_match(p.get("profile"), active_profile)]
+                      if _ontosynth_webui_row_matches_scope_profile(p.get("profile"), active_profile)]
         return j(handler, {
             "projects": scoped,
             "all_profiles": all_profiles,
@@ -3706,6 +4136,9 @@ def handle_get(handler, parsed) -> bool:
         category = qs.get("category", [None])[0]
         data = _skills_list_from_dir(_active_skills_dir(), category=category)
         return j(handler, {"skills": data.get("skills", [])})
+
+    if parsed.path == "/api/ontosynth/skills/overview":
+        return j(handler, _build_ontosynth_skills_overview())
 
     if parsed.path == "/api/skills/content":
         qs = parse_qs(parsed.query)
@@ -4437,9 +4870,6 @@ def handle_post(handler, parsed) -> bool:
             "title": branch_title,
             "parent_session_id": source.session_id,
         })
-
-    if parsed.path == "/api/session/compress/start":
-        return _handle_session_compress_start(handler, body)
 
     if parsed.path == "/api/session/compress":
         return _handle_session_compress(handler, body)
@@ -6124,85 +6554,27 @@ def _handle_live_models(handler, parsed):
             ids = []
 
         if not ids:
-            custom_provider_entry = None
-
-            def _custom_provider_entries_for_request():
-                if not (provider == "custom" or provider.startswith("custom:")):
-                    return []
-                try:
-                    from api.config import _custom_provider_slug_from_name
-                    _cp_entries = cfg.get("custom_providers", [])
-                    if not isinstance(_cp_entries, list):
-                        return []
-                    _matches = []
-                    for _cp in _cp_entries:
-                        if not isinstance(_cp, dict):
-                            continue
-                        _slug = _custom_provider_slug_from_name(_cp.get("name", ""))
-                        if provider.startswith("custom:"):
-                            if _slug == provider:
-                                _matches.append(_cp)
-                        elif provider == "custom" and not _slug:
-                            _matches.append(_cp)
-                    return _matches
-                except Exception:
-                    return []
-
-            def _custom_provider_model_ids(_cp):
-                _ids = []
-
-                def _append(_mid):
-                    _mid = str(_mid or "").strip()
-                    if _mid and _mid not in _ids:
-                        _ids.append(_mid)
-
-                _append(_cp.get("model", ""))
-                _models = _cp.get("models")
-                if isinstance(_models, dict):
-                    for _mid in _models:
-                        if isinstance(_mid, str):
-                            _append(_mid)
-                elif isinstance(_models, list):
-                    for _item in _models:
-                        if isinstance(_item, str):
-                            _append(_item)
-                        elif isinstance(_item, dict):
-                            _append(_item.get("id") or _item.get("model") or _item.get("name"))
-                return _ids
-
-            def _custom_provider_api_key(_cp):
-                _raw = _cp.get("api_key")
-                if _raw is not None:
-                    _key = str(_raw).strip()
-                    if _key.startswith("${") and _key.endswith("}") and len(_key) > 3:
-                        _key = os.getenv(_key[2:-1], "").strip()
-                    if _key:
-                        return _key
-                _env = str(_cp.get("key_env") or "").strip()
-                return os.getenv(_env, "").strip() if _env else ""
-
             # For 'custom' and 'custom:*' providers, provider_model_ids()
             # returns [] because they aren't real hermes_cli endpoints.
             # Fall back to the custom_providers entries from config.yaml so
             # the live-model enrichment step can add any models that weren't
             # already in the static list (issue #1619).
             if provider == "custom" or provider.startswith("custom:"):
-                for _cp in _custom_provider_entries_for_request():
-                    if custom_provider_entry is None:
-                        custom_provider_entry = _cp
-                    ids.extend(_custom_provider_model_ids(_cp))
+                try:
+                    _cp_entries = cfg.get("custom_providers", [])
+                    if isinstance(_cp_entries, list):
+                        ids = [
+                            _cp.get("model", "")
+                            for _cp in _cp_entries
+                            if isinstance(_cp, dict) and _cp.get("model", "")
+                        ]
+                except Exception:
+                    pass
             
             # If still no ids, try fetching from base_url directly (OpenAI-compat endpoint)
             if not ids and (provider == "custom" or provider.startswith("custom:")):
-                _base_url = None
-                _api_key = None
-                if custom_provider_entry:
-                    _base_url = custom_provider_entry.get("base_url")
-                    _api_key = _custom_provider_api_key(custom_provider_entry)
-                else:
-                    _model_cfg = cfg.get("model", {})
-                    _base_url = _model_cfg.get("base_url")
-                    _api_key = _model_cfg.get("api_key")
+                _base_url = cfg.get("model", {}).get("base_url")
+                _api_key = cfg.get("model", {}).get("api_key")
                 if _base_url and _api_key:
                     try:
                         import urllib.request
@@ -7045,7 +7417,7 @@ def _handle_chat_start(handler, body, diag=None):
         attachments = _normalize_chat_attachments(body.get("attachments") or [])[:20]
         diag.stage("resolve_workspace") if diag else None
         try:
-            workspace = _resolve_chat_workspace_with_recovery(s, body.get("workspace"))
+            workspace = str(resolve_trusted_workspace(body.get("workspace") or s.workspace))
         except ValueError as e:
             return bad(handler, str(e))
         requested_model = body.get("model") or s.model
@@ -7076,24 +7448,6 @@ def _handle_chat_start(handler, body, diag=None):
         if diag:
             diag.finish()
 
-
-
-def _resolve_chat_workspace_with_recovery(s, requested_workspace) -> str:
-    """Recover stale implicit session workspaces without hiding explicit errors."""
-    explicit = requested_workspace not in (None, "")
-    candidate = requested_workspace if explicit else getattr(s, "workspace", None)
-    try:
-        return str(resolve_trusted_workspace(candidate))
-    except ValueError:
-        if explicit:
-            raise
-    fallback = str(resolve_trusted_workspace(get_last_workspace()))
-    s.workspace = fallback
-    try:
-        s.save()
-    except Exception:
-        pass
-    return fallback
 
 
 def _normalize_chat_attachments(raw_attachments):
@@ -7765,183 +8119,6 @@ def _handle_clarify_respond(handler, body):
     return j(handler, {"ok": True, "response": response})
 
 
-class _ManualCompressionMemoryHandler:
-    def __init__(self):
-        self.wfile = io.BytesIO()
-        self.status = None
-        self.sent_headers = {}
-
-    def send_response(self, status):
-        self.status = status
-
-    def send_header(self, key, value):
-        self.sent_headers[key] = value
-
-    def end_headers(self):
-        pass
-
-    def payload(self):
-        raw = self.wfile.getvalue().decode("utf-8")
-        return json.loads(raw) if raw else {}
-
-
-def _manual_compression_cleanup_locked(now=None):
-    now = time.time() if now is None else now
-    for sid, job in list(_MANUAL_COMPRESSION_JOBS.items()):
-        if job.get("status") == "running":
-            continue
-        updated_at = float(job.get("updated_at") or job.get("started_at") or now)
-        if now - updated_at > _MANUAL_COMPRESSION_JOB_TTL_SECONDS:
-            _MANUAL_COMPRESSION_JOBS.pop(sid, None)
-
-
-def _manual_compression_status_payload(job):
-    status = job.get("status") or "running"
-    payload = {
-        "ok": status not in {"error", "cancelled"},
-        "status": status,
-        "session_id": job.get("session_id"),
-        "focus_topic": job.get("focus_topic"),
-        "started_at": job.get("started_at"),
-        "updated_at": job.get("updated_at"),
-    }
-    if status == "done":
-        result = job.get("result")
-        if isinstance(result, dict):
-            payload.update(result)
-        payload["status"] = "done"
-        payload["ok"] = True
-    elif status == "error":
-        payload["ok"] = False
-        payload["error"] = job.get("error") or "Compression failed"
-        payload["error_status"] = int(job.get("error_status") or 400)
-    elif status == "cancelled":
-        payload["ok"] = False
-        payload["error"] = job.get("error") or "Compression cancelled"
-        payload["error_status"] = int(job.get("error_status") or 409)
-    return payload
-
-
-def _run_manual_compression_job(sid, body):
-    memory_handler = _ManualCompressionMemoryHandler()
-    try:
-        _handle_session_compress(memory_handler, body)
-        status = int(memory_handler.status or 500)
-        payload = memory_handler.payload()
-        with _MANUAL_COMPRESSION_JOBS_LOCK:
-            job = _MANUAL_COMPRESSION_JOBS.get(sid)
-            if not job:
-                return
-            now = time.time()
-            if status >= 400 or not isinstance(payload, dict) or payload.get("error"):
-                job.update(
-                    {
-                        "status": "error",
-                        "error": str((payload or {}).get("error") or "Compression failed"),
-                        "error_status": status,
-                        "updated_at": now,
-                    }
-                )
-            else:
-                job.update(
-                    {
-                        "status": "done",
-                        "result": payload,
-                        "updated_at": now,
-                    }
-                )
-    except Exception as exc:
-        logger.warning("Manual compression worker failed for session %s: %s", sid, exc)
-        with _MANUAL_COMPRESSION_JOBS_LOCK:
-            job = _MANUAL_COMPRESSION_JOBS.get(sid)
-            if job:
-                job.update(
-                    {
-                        "status": "error",
-                        "error": f"Compression failed: {_sanitize_error(exc)}",
-                        "error_status": 500,
-                        "updated_at": time.time(),
-                    }
-                )
-
-
-def _handle_session_compress_start(handler, body):
-    try:
-        require(body, "session_id")
-    except ValueError as e:
-        return bad(handler, str(e))
-
-    sid = str(body.get("session_id") or "").strip()
-    if not sid:
-        return bad(handler, "session_id is required")
-    try:
-        s = get_session(sid)
-    except KeyError:
-        return bad(handler, "Session not found", 404)
-    if getattr(s, "active_stream_id", None):
-        return bad(handler, "Session is still streaming; wait for the current turn to finish.", 409)
-
-    focus_topic = str(body.get("focus_topic") or body.get("topic") or "").strip()[:500] or None
-    job_body = {"session_id": sid}
-    if focus_topic:
-        job_body["focus_topic"] = focus_topic
-
-    now = time.time()
-    with _MANUAL_COMPRESSION_JOBS_LOCK:
-        _manual_compression_cleanup_locked(now)
-        existing = _MANUAL_COMPRESSION_JOBS.get(sid)
-        if existing:
-            existing_payload = _manual_compression_status_payload(existing)
-            if existing_payload.get("status") == "running":
-                return j(handler, existing_payload)
-            # Stage-344 Opus SHOULD-FIX (#2128): always start fresh on re-invoke.
-            # The prior implementation short-circuited and returned a stale `done`
-            # payload for the full 10-minute TTL window when /compress/start was
-            # re-invoked, so a user closing the tab mid-compress and re-running
-            # /compress on a fresh open would get the previous result back rather
-            # than a new compression. Drop the entry and fall through to the
-            # fresh-worker path below.
-            _MANUAL_COMPRESSION_JOBS.pop(sid, None)
-        job = {
-            "session_id": sid,
-            "focus_topic": focus_topic,
-            "status": "running",
-            "started_at": now,
-            "updated_at": now,
-        }
-        _MANUAL_COMPRESSION_JOBS[sid] = job
-
-    worker = threading.Thread(
-        target=_run_manual_compression_job,
-        args=(sid, job_body),
-        name=f"manual-compress-{sid[:8]}",
-        daemon=True,
-    )
-    worker.start()
-
-    with _MANUAL_COMPRESSION_JOBS_LOCK:
-        return j(handler, _manual_compression_status_payload(_MANUAL_COMPRESSION_JOBS.get(sid, job)))
-
-
-def _handle_session_compress_status(handler, sid):
-    sid = str(sid or "").strip()
-    if not sid:
-        return bad(handler, "session_id is required")
-    with _MANUAL_COMPRESSION_JOBS_LOCK:
-        _manual_compression_cleanup_locked()
-        job = _MANUAL_COMPRESSION_JOBS.get(sid)
-        if not job:
-            return j(handler, {"ok": True, "status": "idle", "session_id": sid})
-        payload = _manual_compression_status_payload(job)
-        # Stage-344 Opus SHOULD-FIX (#2128): do not pop the job on first
-        # read of a `done` payload. The session may be open in multiple
-        # tabs, and the first tab's poll would otherwise leave the second
-        # tab with `idle` and a "Compression job is no longer available"
-        # toast. Let the 10-minute TTL handle eviction so all open tabs
-        # see the same terminal payload.
-        return j(handler, payload)
-
-
 def _handle_session_compress(handler, body):
     def _anchor_message_key(m):
         if not isinstance(m, dict):
@@ -8140,12 +8317,6 @@ def _handle_session_compress(handler, body):
         # Lock contract: hold for the in-memory mutation only, never across
         # network I/O.
         original_messages = list(messages)
-        original_stream_state = (
-            getattr(s, "active_stream_id", None),
-            getattr(s, "pending_user_message", None),
-            copy.deepcopy(getattr(s, "pending_attachments", None)),
-            getattr(s, "pending_started_at", None),
-        )
         approx_tokens = _estimate_messages_tokens_rough(original_messages)
 
         agent = _run_agent.AIAgent(
@@ -8177,14 +8348,6 @@ def _handle_session_compress(handler, body):
         with _cfg._get_session_agent_lock(sid):
             # Re-read messages to detect concurrent edits during the LLM call.
             # If the history changed, the compression result is stale — abort.
-            current_stream_state = (
-                getattr(s, "active_stream_id", None),
-                getattr(s, "pending_user_message", None),
-                copy.deepcopy(getattr(s, "pending_attachments", None)),
-                getattr(s, "pending_started_at", None),
-            )
-            if current_stream_state != original_stream_state:
-                return bad(handler, "Session stream state changed during compression; please retry.", 409)
             if _sanitize_messages_for_api(s.messages) != original_messages:
                 return bad(handler, "Session was modified during compression; please retry.", 409)
 

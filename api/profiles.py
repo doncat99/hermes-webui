@@ -40,8 +40,145 @@ _tls = threading.local()
 
 _SKILL_HOME_MODULES = ("tools.skills_tool", "tools.skill_manager_tool")
 
+# ONTOSYNTH-PROFILE-SCOPE-BEGIN
+def _ontosynth_webui_profile_scope():
+    import json as _json
+    import os as _os
+    from pathlib import Path as _Path
 
-def patch_skill_home_modules(home: Path) -> None:
+    candidate_paths = []
+    raw_path = _os.getenv("ONTOSYNTH_WEBUI_PROFILE_SCOPE_PATH", "").strip()
+    if raw_path:
+        candidate_paths.append(_Path(raw_path).expanduser())
+    try:
+        module_path = _Path(__file__).resolve()
+        for parent in module_path.parents:
+            candidate_paths.append(parent / ".ontosynth" / "webui_profile_scope.json")
+    except Exception:
+        pass
+    try:
+        cwd = _Path.cwd().resolve()
+        for parent in [cwd, *cwd.parents]:
+            candidate_paths.append(parent / ".ontosynth" / "webui_profile_scope.json")
+    except Exception:
+        pass
+
+    seen = set()
+    for path in candidate_paths:
+        path_key = str(path)
+        if path_key in seen:
+            continue
+        seen.add(path_key)
+        if not path.exists():
+            continue
+        try:
+            payload = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        profile_keys = payload.get("profile_keys") or []
+        if not isinstance(profile_keys, list):
+            continue
+        return payload
+    return None
+
+
+def _ontosynth_webui_scope_allows_name(name):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return True
+    allowed = {str(item) for item in payload.get("profile_keys", [])}
+    if str(name) in allowed:
+        return True
+    return bool(payload.get("include_default_profile")) and str(name) == "default"
+
+
+def _ontosynth_webui_default_active_profile():
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return None
+    profile_keys = payload.get("profile_keys") or []
+    if profile_keys:
+        return str(profile_keys[0])
+    if bool(payload.get("include_default_profile")):
+        return "default"
+    return None
+
+
+def _ontosynth_webui_scoped_profile_keys():
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return []
+    return [str(item) for item in payload.get("profile_keys", []) if str(item).strip()]
+
+
+def _ontosynth_webui_runtime_identity_for_profile(profile_key):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return None
+    for profile in payload.get("profiles", []) or []:
+        if not isinstance(profile, dict):
+            continue
+        if str(profile.get("hermes_profile_key") or "") == str(profile_key):
+            runtime_identity = str(profile.get("runtime_identity") or "").strip()
+            return runtime_identity or None
+    return None
+
+
+def _ontosynth_webui_profile_label(profile_key):
+    runtime_identity = _ontosynth_webui_runtime_identity_for_profile(profile_key)
+    if runtime_identity:
+        return runtime_identity.replace("-", " ").title()
+    return str(profile_key).replace("-", " ").title()
+
+
+def _ontosynth_webui_scope_profile_home(profile_key):
+    from pathlib import Path as _Path
+
+    base_home = _Path.home() / ".hermes"
+    try:
+        base_home = _DEFAULT_HERMES_HOME
+    except NameError:
+        pass
+    if str(profile_key) == "default":
+        return base_home
+    return base_home / "profiles" / str(profile_key)
+
+
+def filter_profiles_for_ontosynth_webui_scope(profiles):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return profiles
+    return [
+        profile
+        for profile in list(profiles or [])
+        if isinstance(profile, dict)
+        and _ontosynth_webui_scope_allows_name(profile.get("name"))
+    ]
+
+
+def filter_assignees_for_ontosynth_webui_scope(assignees):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return assignees
+    filtered = []
+    for assignee in list(assignees or []):
+        name = assignee.get("name") if isinstance(assignee, dict) else assignee
+        counts = assignee.get("counts") if isinstance(assignee, dict) else None
+        if _ontosynth_webui_scope_allows_name(name) or bool(counts):
+            filtered.append(assignee)
+    return filtered
+
+
+def _ontosynth_webui_row_matches_scope_profile(row_profile, active_profile):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return _profiles_match(row_profile, active_profile)
+    allowed = set(_ontosynth_webui_scoped_profile_keys())
+    row = str(row_profile or "default")
+    return row in allowed or (row == "default" and bool(payload.get("include_default_profile")))
+# ONTOSYNTH-PROFILE-SCOPE-END
+
+def _patch_skill_home_modules(home: Path) -> None:
     """Patch imported skill modules that cache HERMES_HOME at import time."""
     for module_name in _SKILL_HOME_MODULES:
         module = sys.modules.get(module_name)
@@ -224,7 +361,7 @@ def get_active_profile_name() -> str:
     tls_name = getattr(_tls, 'profile', None)
     if tls_name is not None:
         return tls_name
-    return _active_profile
+    return _ontosynth_webui_default_active_profile() or _active_profile
 
 
 def set_request_profile(name: str) -> None:
@@ -628,7 +765,7 @@ def _set_hermes_home(home: Path):
     """Set HERMES_HOME env var and monkey-patch cached module-level paths."""
     os.environ['HERMES_HOME'] = str(home)
 
-    patch_skill_home_modules(home)
+    _patch_skill_home_modules(home)
 
     # Patch cron/jobs module-level cache
     try:
@@ -857,7 +994,7 @@ def list_profiles_api() -> list:
             'has_env': p.has_env,
             'skill_count': p.skill_count,
         })
-    return result
+    return filter_profiles_for_ontosynth_webui_scope(result)
 
 
 def _default_profile_dict() -> dict:

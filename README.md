@@ -93,6 +93,37 @@ ecosystem. See [HERMES.md](HERMES.md) for the full side-by-side.
 
 ---
 
+## OntoSynth Scoped Skills
+
+This fork is also the current `8787` runtime inspection shell for OntoSynth.
+
+When OntoSynth writes `.ontosynth/webui_profile_scope.json`, the Skills panel
+switches into a project-scoped operator mode with three layers:
+
+- `Platform Catalog`
+- `Project Contract`
+- `Runtime Materialized`
+
+This mode is meant to answer different questions from the HUD console:
+
+- what skills exist in the Hermes platform catalog
+- what a project role contract says should be preloaded or governed
+- what the concrete scoped Hermes profile actually materialized at runtime
+
+Runtime materialized skill detail supports drilldown to a concrete runtime
+skill. The detail view shows:
+
+- runtime verification status
+- contract backlink
+- collapsible reference content for the real materialized skill source
+
+For OntoSynth operators, the intended split is:
+
+- `3001`: Knowledge Governance Console, truth and governance chain
+- `8787`: Hermes sessions, Kanban, profiles, and runtime skill inspection
+
+---
+
 ## Quick start
 
 Run the repo bootstrap:

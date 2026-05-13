@@ -23,6 +23,143 @@ from api.helpers import bad, j
 BOARD_COLUMNS = ["triage", "todo", "ready", "running", "blocked", "done"]
 _TASK_PREFIX = "/api/kanban/tasks/"
 
+# ONTOSYNTH-PROFILE-SCOPE-BEGIN
+def _ontosynth_webui_profile_scope():
+    import json as _json
+    import os as _os
+    from pathlib import Path as _Path
+
+    candidate_paths = []
+    raw_path = _os.getenv("ONTOSYNTH_WEBUI_PROFILE_SCOPE_PATH", "").strip()
+    if raw_path:
+        candidate_paths.append(_Path(raw_path).expanduser())
+    try:
+        module_path = _Path(__file__).resolve()
+        for parent in module_path.parents:
+            candidate_paths.append(parent / ".ontosynth" / "webui_profile_scope.json")
+    except Exception:
+        pass
+    try:
+        cwd = _Path.cwd().resolve()
+        for parent in [cwd, *cwd.parents]:
+            candidate_paths.append(parent / ".ontosynth" / "webui_profile_scope.json")
+    except Exception:
+        pass
+
+    seen = set()
+    for path in candidate_paths:
+        path_key = str(path)
+        if path_key in seen:
+            continue
+        seen.add(path_key)
+        if not path.exists():
+            continue
+        try:
+            payload = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        profile_keys = payload.get("profile_keys") or []
+        if not isinstance(profile_keys, list):
+            continue
+        return payload
+    return None
+
+
+def _ontosynth_webui_scope_allows_name(name):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return True
+    allowed = {str(item) for item in payload.get("profile_keys", [])}
+    if str(name) in allowed:
+        return True
+    return bool(payload.get("include_default_profile")) and str(name) == "default"
+
+
+def _ontosynth_webui_default_active_profile():
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return None
+    profile_keys = payload.get("profile_keys") or []
+    if profile_keys:
+        return str(profile_keys[0])
+    if bool(payload.get("include_default_profile")):
+        return "default"
+    return None
+
+
+def _ontosynth_webui_scoped_profile_keys():
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return []
+    return [str(item) for item in payload.get("profile_keys", []) if str(item).strip()]
+
+
+def _ontosynth_webui_runtime_identity_for_profile(profile_key):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return None
+    for profile in payload.get("profiles", []) or []:
+        if not isinstance(profile, dict):
+            continue
+        if str(profile.get("hermes_profile_key") or "") == str(profile_key):
+            runtime_identity = str(profile.get("runtime_identity") or "").strip()
+            return runtime_identity or None
+    return None
+
+
+def _ontosynth_webui_profile_label(profile_key):
+    runtime_identity = _ontosynth_webui_runtime_identity_for_profile(profile_key)
+    if runtime_identity:
+        return runtime_identity.replace("-", " ").title()
+    return str(profile_key).replace("-", " ").title()
+
+
+def _ontosynth_webui_scope_profile_home(profile_key):
+    from pathlib import Path as _Path
+
+    base_home = _Path.home() / ".hermes"
+    try:
+        base_home = _DEFAULT_HERMES_HOME
+    except NameError:
+        pass
+    if str(profile_key) == "default":
+        return base_home
+    return base_home / "profiles" / str(profile_key)
+
+
+def filter_profiles_for_ontosynth_webui_scope(profiles):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return profiles
+    return [
+        profile
+        for profile in list(profiles or [])
+        if isinstance(profile, dict)
+        and _ontosynth_webui_scope_allows_name(profile.get("name"))
+    ]
+
+
+def filter_assignees_for_ontosynth_webui_scope(assignees):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return assignees
+    filtered = []
+    for assignee in list(assignees or []):
+        name = assignee.get("name") if isinstance(assignee, dict) else assignee
+        counts = assignee.get("counts") if isinstance(assignee, dict) else None
+        if _ontosynth_webui_scope_allows_name(name) or bool(counts):
+            filtered.append(assignee)
+    return filtered
+
+
+def _ontosynth_webui_row_matches_scope_profile(row_profile, active_profile):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return _profiles_match(row_profile, active_profile)
+    allowed = set(_ontosynth_webui_scoped_profile_keys())
+    row = str(row_profile or "default")
+    return row in allowed or (row == "default" and bool(payload.get("include_default_profile")))
+# ONTOSYNTH-PROFILE-SCOPE-END
 
 def _kb():
     from hermes_cli import kanban_db as kb
@@ -541,7 +678,7 @@ def _config_payload(*, board=None):
     k_cfg = ((cfg.get("dashboard") or {}).get("kanban") or {})
     return {
         "columns": BOARD_COLUMNS,
-        "assignees": assignees,
+        "assignees": filter_assignees_for_ontosynth_webui_scope(assignees),
         "default_tenant": k_cfg.get("default_tenant") or "",
         "lane_by_profile": bool(k_cfg.get("lane_by_profile", True)),
         "include_archived_by_default": bool(k_cfg.get("include_archived_by_default", False)),
@@ -578,7 +715,7 @@ def _assignees_payload(*, board=None):
                 "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND assignee != '' ORDER BY assignee"
             ).fetchall()
             assignees = [row["assignee"] for row in rows]
-    return {"assignees": assignees}
+    return {"assignees": filter_assignees_for_ontosynth_webui_scope(assignees)}
 
 
 def _task_log_payload(parsed, task_id: str):

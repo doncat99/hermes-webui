@@ -175,6 +175,26 @@ function _setButtonTooltip(btn, text){
   }
 }
 
+// ONTOSYNTH-BOOT-UI-BEGIN
+function _ontosynthScopedBootEnabled(){
+  if(typeof window==='undefined') return false;
+  return !!window.ONTOSYNTH_WEBUI_SCOPE_ACTIVE;
+}
+function _ontosynthScopedBootDefaultPanel(){
+  if(typeof window==='undefined') return '';
+  return String(window.ONTOSYNTH_WEBUI_DEFAULT_PANEL||'').trim();
+}
+function _ontosynthScopedBootDefaultBoard(){
+  if(typeof window==='undefined') return '';
+  return String(window.ONTOSYNTH_WEBUI_DEFAULT_KANBAN_BOARD||'').trim();
+}
+function _ontosynthApplyScopedBootDefaults(){
+  const board=_ontosynthScopedBootDefaultBoard();
+  if(!board) return;
+  try{ localStorage.setItem('hermes-kanban-active-board', board); }catch(_){}
+}
+// ONTOSYNTH-BOOT-UI-END
+
 function syncWorkspacePanelUI(){
   const {layout,panel,toggleBtn,collapseBtn}= _workspacePanelEls();
   if(!layout||!panel)return;
@@ -1373,6 +1393,11 @@ function applyBotName(){
   try{
     const s=await api('/api/settings');
     _bootSettings=s;
+    window.ONTOSYNTH_WEBUI_SCOPE_ACTIVE=!!s.ontosynth_scope_active;
+    window.ONTOSYNTH_WEBUI_PROFILE_SCOPE_PATH=s.ontosynth_scope_path||'';
+    window.ONTOSYNTH_WEBUI_DEFAULT_PANEL=s.ontosynth_default_panel||'';
+    window.ONTOSYNTH_WEBUI_DEFAULT_KANBAN_BOARD=s.ontosynth_default_kanban_board||'';
+    _ontosynthApplyScopedBootDefaults();
     window._sendKey=s.send_key||'enter';
     window._showTokenUsage=!!s.show_token_usage;
     window._showTps=!!s.show_tps;
@@ -1487,7 +1512,8 @@ function applyBotName(){
   const urlSession=(typeof _sessionIdFromLocation==='function')?_sessionIdFromLocation():null;
   const savedLocal=localStorage.getItem('hermes-webui-session');
   const saved=urlSession||savedLocal;
-  if(saved){
+  const scopedBoot=_ontosynthScopedBootEnabled();
+  if(saved && !(scopedBoot && !urlSession)){
     try{
       if(!urlSession&&savedLocal&&await _savedSessionShouldStaySidebarOnly(savedLocal)){
         S.session=null; S.messages=[]; S.activeStreamId=null; S.busy=false;
@@ -1537,6 +1563,9 @@ function applyBotName(){
   // no saved session - show empty state, wait for user to hit +
   S._bootReady=true;
   syncTopbar();
+  if(scopedBoot && _ontosynthScopedBootDefaultPanel()==='kanban' && typeof switchPanel==='function'){
+    await switchPanel('kanban');
+  }
   // Restore panel pref so the workspace panel stays visible on a fresh load if the
   // user had it open during their last session (#workspace-persist).
   const _freshPanelPref=localStorage.getItem('hermes-webui-workspace-panel-pref')==='open'
