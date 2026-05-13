@@ -246,10 +246,7 @@ function _isSessionEffectivelyStreaming(s) {
 function _purgeStaleInflightEntries() {
   // Clean up INFLIGHT entries for sessions the server confirms are NOT
   // streaming. This prevents the in-memory cache from growing unbounded
-  // when streams end abnormally. (#2066)  Additionally, any INFLIGHT entry
-  // whose session id is no longer present in the current _allSessions list
-  // (deleted / archived / filtered out) is also removed so that ghost entries
-  // from deleted sessions do not accumulate. (#2092)
+  // when streams end abnormally. (#2066)
   if (typeof INFLIGHT !== 'object' || !INFLIGHT) return;
   const sessionsById = new Map();
   if (Array.isArray(_allSessions)) {
@@ -258,20 +255,11 @@ function _purgeStaleInflightEntries() {
     }
   }
   for (const sid of Object.keys(INFLIGHT)) {
-    if (!sessionsById.has(sid)) {
-      // Session is absent from _allSessions — it was deleted / archived /
-      // filtered and can never stream again, so drop the entry.
-      delete INFLIGHT[sid];
-      if (typeof clearInflightState === 'function') clearInflightState(sid);
-      continue;
-    }
     const s = sessionsById.get(sid);
-    if (!s.is_streaming) {
-      // Session exists but is not streaming — purge it.
+    if (s && !s.is_streaming) {
       delete INFLIGHT[sid];
       if (typeof clearInflightState === 'function') clearInflightState(sid);
     }
-    // Sessions that exist and are still streaming are preserved.
   }
 }
 
@@ -510,6 +498,30 @@ async function loadSession(sid){
   S.session=data.session;
   S.session._modelResolutionDeferred=true;
   S.lastUsage={...(data.session.last_usage||{})};
+  const _sessionProfile = (S.session && S.session.profile) ? S.session.profile : 'default';
+  if (_sessionProfile && _sessionProfile !== (S.activeProfile || 'default')) {
+    try {
+      const switched = await api('/api/profile/switch', {
+        method: 'POST',
+        body: JSON.stringify({ name: _sessionProfile }),
+      });
+      S.activeProfile = switched.active || _sessionProfile;
+      if (typeof applyBotName === 'function') applyBotName();
+      const _profileLabel = $('profileChipLabel');
+      if (_profileLabel) _profileLabel.textContent = S.activeProfile || 'default';
+      if (typeof _clearPersistedModelState === 'function') _clearPersistedModelState();
+      else localStorage.removeItem('hermes-webui-model');
+      if (typeof _skillsData !== 'undefined') _skillsData = null;
+      if (typeof _cronSkillsCache !== 'undefined') _cronSkillsCache = null;
+      if (typeof _workspaceList !== 'undefined') _workspaceList = null;
+      if (typeof populateModelDropdown === 'function' && typeof loadWorkspaceList === 'function') {
+        await Promise.all([populateModelDropdown(), loadWorkspaceList()]);
+      }
+      if (typeof _currentPanel !== 'undefined' && _currentPanel === 'skills' && typeof loadSkills === 'function') {
+        await loadSkills();
+      }
+    } catch (_) {}
+  }
   // Reset scroll-direction tracker on session switch so the new chat's
   // first scroll doesn't compare against the previous chat's scrollTop
   // and false-trigger an unpin (#1731 follow-up — Opus stage-302 SHOULD-FIX).
@@ -653,7 +665,6 @@ async function loadSession(sid){
       setComposerStatus('');
       updateQueueBadge(sid);
       syncTopbar();renderMessages();
-      if(typeof resumeManualCompressionForSession==='function') resumeManualCompressionForSession(sid);
       // Kick off loadDir first (issues network requests), then highlight code.
       // The fetch is dispatched before the CPU-bound Prism pass begins.
       const _dirP=loadDir('.');
@@ -1264,6 +1275,20 @@ async function _ensureAllMessagesLoaded() {
   }
 }
 
+// ONTOSYNTH-SESSION-UI-BEGIN
+function _ontosynthScopedSessionListEnabled(){
+  if(typeof window==='undefined') return false;
+  const scopePath=(window.ONTOSYNTH_WEBUI_PROFILE_SCOPE_PATH||'').trim();
+  return !!scopePath;
+}
+function _ontosynthIsProbeSession(session){
+  if(!session||typeof session!=='object') return false;
+  const title=String(session.title||'').trim();
+  if(!title) return false;
+  return /^Project Manager Session\b.*\bOK$/i.test(title);
+}
+// ONTOSYNTH-SESSION-UI-END
+
 let _allSessions = [];  // cached for search filter
 let _renamingSid = null;  // session_id currently being renamed (blocks list re-renders)
 let _showArchived = false;  // toggle to show archived sessions
@@ -1278,16 +1303,13 @@ let _allProjects = [];  // cached project list
 // double-underscore prefixes provide.
 const NO_PROJECT_FILTER = '__none__';
 let _activeProject = null;  // project_id filter (null = show all, NO_PROJECT_FILTER = unassigned only)
-let _showAllProfiles = false;  // false = filter to active profile only
+let _showAllProfiles = _ontosynthScopedSessionListEnabled();  // OntoSynth-scoped WebUI defaults to all team profiles
 let _otherProfileCount = 0;       // count of sessions from other profiles (server-reported)
 let _sessionActionMenu = null;
 let _sessionActionAnchor = null;
 let _sessionActionSessionId = null;
 const _expandedChildSessionKeys = new Set();
 const _expandedLineageKeys = new Set();
-const _lineageReportCache = new Map();
-const _lineageReportInflight = new Map();
-let _lineageReportCacheGeneration = 0;
 let _sessionVisibleSidebarIds = [];
 const SESSION_VIRTUAL_ROW_HEIGHT = 52;
 const SESSION_VIRTUAL_BUFFER_ROWS = 12;
@@ -1774,7 +1796,6 @@ async function renderSessionList(){
     // without a second round-trip. Stashed on the module for renderSessionListFromCache.
     _otherProfileCount = sessData.other_profile_count || 0;
     _allSessions = _mergeOptimisticFirstTurnSessions(sessData.sessions||[]);
-    _clearLineageReportCache();
     _allProjects = projData.projects||[];
     // Capture server clock for clock-skew compensation (issue #1144).
     // server_time is epoch seconds from the server's time.time().
@@ -2112,73 +2133,6 @@ function _sessionSegmentCount(s){
   return count>1?count:0;
 }
 
-function _clearLineageReportCache(){
-  _lineageReportCache.clear();
-  _lineageReportInflight.clear();
-  _lineageReportCacheGeneration++;
-}
-
-function _lineageReportCacheKey(s,lineageKey){
-  return lineageKey||_sidebarLineageKeyForRow(s)||null;
-}
-
-function _lineageLocalSegmentCount(s){
-  if(!s) return 0;
-  if(Array.isArray(s._lineage_segments)) return s._lineage_segments.length;
-  return s.session_id?1:0;
-}
-
-function _lineageReportNeedsFetch(s,lineageKey,segmentCount){
-  const key=_lineageReportCacheKey(s,lineageKey);
-  if(!s||!s.session_id||!key) return false;
-  if(_lineageReportCache.has(key)||_lineageReportInflight.has(key)) return false;
-  return Number(segmentCount||0)>_lineageLocalSegmentCount(s);
-}
-
-function _lineageSegmentsForRender(s,lineageKey){
-  const segments=[];
-  const seen=new Set();
-  const currentSid=s&&s.session_id;
-  const addSegment=(seg)=>{
-    if(!seg||!seg.session_id||seg.session_id===currentSid||seen.has(seg.session_id)) return;
-    if(seg.role==='child_session') return;
-    seen.add(seg.session_id);
-    segments.push({...seg});
-  };
-  for(const seg of (Array.isArray(s&&s._lineage_segments)?s._lineage_segments:[])) addSegment(seg);
-  const cached=_lineageReportCache.get(_lineageReportCacheKey(s,lineageKey));
-  if(cached&&Array.isArray(cached.segments)){
-    for(const seg of cached.segments) addSegment(seg);
-  }
-  return segments;
-}
-
-function _fetchLineageReportForRow(s,lineageKey){
-  const key=_lineageReportCacheKey(s,lineageKey);
-  if(!s||!s.session_id||!key) return Promise.resolve(null);
-  if(_lineageReportCache.has(key)) return Promise.resolve(_lineageReportCache.get(key));
-  if(_lineageReportInflight.has(key)) return _lineageReportInflight.get(key);
-  const generation=_lineageReportCacheGeneration;
-  let request;
-  request=api('/api/session/lineage/report?session_id='+encodeURIComponent(s.session_id))
-    .then(report=>{
-      if(generation===_lineageReportCacheGeneration){
-        _lineageReportCache.set(key,(report&&report.found!==false)?report:{error:true});
-      }
-      return report;
-    })
-    .catch(err=>{
-      console.warn('lineage report',err);
-      if(generation===_lineageReportCacheGeneration) _lineageReportCache.set(key,{error:true});
-      return null;
-    })
-    .finally(()=>{
-      if(_lineageReportInflight.get(key)===request) _lineageReportInflight.delete(key);
-    });
-  _lineageReportInflight.set(key,request);
-  return request;
-}
-
 function _sidebarLineageKeyForRow(s){
   if(!s) return null;
   return s._lineage_key||s._lineage_root_id||s.lineage_root_id||s.parent_session_id||s.session_id||null;
@@ -2451,11 +2405,12 @@ function renderSessionListFromCache(){
     _activeProject===NO_PROJECT_FILTER
       ?profileFiltered.filter(s=>!s.project_id)
       :(_activeProject?profileFiltered.filter(s=>s.project_id===_activeProject):profileFiltered);
+  const nonProbeSessions=projectFiltered.filter(s=>!_ontosynthIsProbeSession(s));
   // Filter archived unless toggle is on
-  const sessionsRaw=_showArchived?projectFiltered:projectFiltered.filter(s=>!s.archived);
+  const sessionsRaw=_showArchived?nonProbeSessions:nonProbeSessions.filter(s=>!s.archived);
   const sessions=_attachChildSessionsToSidebarRows(_collapseSessionLineageForSidebar(sessionsRaw), sessionsRaw);
   _syncSidebarExpansionForActiveSession(sessions, activeSidForSidebar);
-  const archivedCount=projectFiltered.filter(s=>s.archived).length;
+  const archivedCount=nonProbeSessions.filter(s=>s.archived).length;
   const list=$('sessionList');
   const listScrollTopBeforeRender=list.scrollTop||0;
   list.innerHTML='';
@@ -2480,7 +2435,7 @@ function renderSessionListFromCache(){
   else{batchBar.style.display='none';}
   // Project filter bar — show when there are real projects OR there are
   // unassigned sessions (so the Unassigned chip has something to filter to).
-  const hasUnprojected=profileFiltered.some(s=>!s.project_id);
+  const hasUnprojected=nonProbeSessions.some(s=>!s.project_id);
   if(_allProjects.length>0||hasUnprojected){
     const bar=document.createElement('div');
     bar.className='project-bar';
@@ -2787,10 +2742,8 @@ function renderSessionListFromCache(){
     }
     const lineageKey=_sidebarLineageKeyForRow(s);
     const segmentCount=_sessionSegmentCount(s);
-    const lineageSegments=_lineageSegmentsForRender(s,lineageKey);
-    const needsLineageReport=_lineageReportNeedsFetch(s,lineageKey,segmentCount);
-    const lineageReportKey=_lineageReportCacheKey(s,lineageKey);
-    const canExpandLineageSegments=Boolean(lineageKey&&segmentCount>1&&(lineageSegments.length>0||needsLineageReport||_lineageReportInflight.has(lineageReportKey)));
+    const lineageSegments=Array.isArray(s._lineage_segments)?s._lineage_segments.filter(seg=>seg&&seg.session_id&&seg.session_id!==s.session_id):[];
+    const canExpandLineageSegments=Boolean(lineageKey&&segmentCount>1&&lineageSegments.length>0);
     const lineageSegmentsExpanded=canExpandLineageSegments&&_expandedLineageKeys.has(lineageKey);
     if(segmentCount>0){
       const segmentCountEl=document.createElement('span');
@@ -2807,10 +2760,7 @@ function renderSessionListFromCache(){
           e.preventDefault();
           e.stopPropagation();
           if(_expandedLineageKeys.has(lineageKey)) _expandedLineageKeys.delete(lineageKey);
-          else {
-            _expandedLineageKeys.add(lineageKey);
-            if(needsLineageReport) _fetchLineageReportForRow(s,lineageKey).then(()=>renderSessionListFromCache());
-          }
+          else _expandedLineageKeys.add(lineageKey);
           renderSessionListFromCache();
         };
         segmentCountEl.onclick=toggleLineageSegments;

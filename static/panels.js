@@ -2918,66 +2918,6 @@ function _renderLlmWikiStatus(d) {
     </div>`;
 }
 
-/**
- * Bucket daily token rows for chart display.
- * Returns rows unchanged when length <= 30 (per-day resolution).
- * For longer ranges, groups consecutive days into buckets:
- *   31–90 days → 2-day buckets
- *   91–180 days → 3-day buckets
- *   181–365 days → 8-day buckets
- * Result is always <= ~52 bars.
- * Each bucket row has:
- *   - label: short label for axis (e.g. MM-DD or MM-DD–MM-DD)
- *   - title: full tooltip title (e.g. 2026-01-01 – 2026-01-05)
- *   - date: first date in bucket (used for date label slicing)
- *   - input_tokens, output_tokens, sessions, cost: summed across bucket
- */
-function _bucketDailyTokensForChart(rows) {
-  if (!Array.isArray(rows) || rows.length === 0) return [];
-  const len = rows.length;
-  if (len <= 30) return rows;  // per-day resolution for 7/30-day ranges
-
-  // Target <= 75 bars; derive bucket size
-  let bucketSize;
-  if (len <= 90) {
-    bucketSize = 2;
-  } else if (len <= 180) {
-    bucketSize = 3;
-  } else if (len <= 365) {
-    bucketSize = 8;  // <=52 bars for 365 days (ceil(365/8)=46)
-  } else {
-    bucketSize = 8;  // fallback for >365 (shouldn't occur in practice)
-  }
-
-  const result = [];
-  for (let i = 0; i < len; i += bucketSize) {
-    const slice = rows.slice(i, i + bucketSize);
-    const input_tokens = slice.reduce((s, r) => s + Number(r.input_tokens || 0), 0);
-    const output_tokens = slice.reduce((s, r) => s + Number(r.output_tokens || 0), 0);
-    const sessions = slice.reduce((s, r) => s + Number(r.sessions || 0), 0);
-    const cost = slice.reduce((s, r) => s + Number(r.cost || 0), 0);
-
-    const firstDate = slice[0].date;
-    const lastDate = slice[slice.length - 1].date;
-
-    // Label: short form for axis
-    const firstLabel = String(firstDate).slice(5);  // MM-DD
-    const lastLabel = String(lastDate).slice(5);
-    const label = (firstDate === lastDate) ? firstLabel : (firstLabel + '–' + lastLabel);
-
-    result.push({
-      label,
-      title: firstDate + (firstDate !== lastDate ? ' – ' + lastDate : ''),
-      date: firstDate,
-      input_tokens,
-      output_tokens,
-      sessions,
-      cost,
-    });
-  }
-  return result;
-}
-
 function _renderInsights(d, box, wikiStatus) {
   const fmtNum = n => Number(n || 0).toLocaleString();
   const fmtCost = c => {
@@ -2997,24 +2937,21 @@ function _renderInsights(d, box, wikiStatus) {
     { label: t('insights_cost'), value: fmtCost(d.total_cost), icon: li('dollar-sign', 18) },
   ];
 
-  // Daily token trend — bucket long ranges to avoid horizontal overflow
+  // Daily token trend
   const dailyTokens = Array.isArray(d.daily_tokens) ? d.daily_tokens : [];
-  const chartRows = _bucketDailyTokensForChart(dailyTokens);
   let dailyHtml = '';
-  if (chartRows.length) {
-    const maxDailyTokens = Math.max(...chartRows.map(r => Number(r.input_tokens || 0) + Number(r.output_tokens || 0)), 1);
-    const labelEvery = Math.max(Math.ceil(chartRows.length / 7), 1);
+  if (dailyTokens.length) {
+    const maxDailyTokens = Math.max(...dailyTokens.map(r => Number(r.input_tokens || 0) + Number(r.output_tokens || 0)), 1);
+    const labelEvery = Math.max(Math.ceil(dailyTokens.length / 7), 1);
     dailyHtml = `<div class="insights-card"><div class="insights-card-title">${esc(t('insights_daily_tokens'))}</div><div class="insights-daily-token-chart">` +
-      chartRows.map((r, idx) => {
+      dailyTokens.map((r, idx) => {
         const input = Number(r.input_tokens || 0);
         const output = Number(r.output_tokens || 0);
         const inputPct = Math.max((input / maxDailyTokens) * 100, input ? 2 : 0).toFixed(1);
         const outputPct = Math.max((output / maxDailyTokens) * 100, output ? 2 : 0).toFixed(1);
-        const showLabel = idx === 0 || idx === chartRows.length - 1 || idx % labelEvery === 0;
-        const titleDate = r.title || r.date;
-        const title = `${titleDate} · ${fmtTokens(input)} ${t('insights_input_tokens')} · ${fmtTokens(output)} ${t('insights_output_tokens')} · ${fmtCost(r.cost)} · ${fmtNum(r.sessions)} ${t('insights_sessions')}`;
-        const labelText = r.label !== undefined ? r.label : String(r.date).slice(5);
-        return `<div class="insights-daily-bar" title="${esc(title)}"><div class="insights-daily-stack" aria-label="${esc(title)}"><div class="insights-daily-bar-output" style="height:${outputPct}%"></div><div class="insights-daily-bar-input" style="height:${inputPct}%"></div></div><span>${showLabel ? esc(labelText) : ''}</span></div>`;
+        const showLabel = idx === 0 || idx === dailyTokens.length - 1 || idx % labelEvery === 0;
+        const title = `${r.date} · ${fmtTokens(input)} ${t('insights_input_tokens')} · ${fmtTokens(output)} ${t('insights_output_tokens')} · ${fmtCost(r.cost)} · ${fmtNum(r.sessions)} ${t('insights_sessions')}`;
+        return `<div class="insights-daily-bar" title="${esc(title)}"><div class="insights-daily-stack" aria-label="${esc(title)}"><div class="insights-daily-bar-output" style="height:${outputPct}%"></div><div class="insights-daily-bar-input" style="height:${inputPct}%"></div></div><span>${showLabel ? esc(String(r.date).slice(5)) : ''}</span></div>`;
       }).join('') +
       `</div><div class="insights-daily-legend"><span><i class="insights-daily-legend-input"></i>${esc(t('insights_input_tokens'))}</span><span><i class="insights-daily-legend-output"></i>${esc(t('insights_output_tokens'))}</span></div></div>`;
   } else {
@@ -3086,7 +3023,7 @@ function _renderInsights(d, box, wikiStatus) {
       ${overviewCards.map(c => `<div class="insights-stat"><div class="insights-stat-icon">${c.icon}</div><div class="insights-stat-info"><div class="insights-stat-value">${c.value}</div><div class="insights-stat-label">${esc(c.label)}</div></div></div>`).join('')}
     </div>
     ${dailyHtml}
-    <div class="insights-row insights-usage-grid">
+    <div class="insights-row">
       ${tokenCards}
       ${modelsHtml}
     </div>
@@ -3117,7 +3054,13 @@ async function loadSkills() {
   if (_skillsData) { renderSkills(_skillsData); return; }
   const box = $('skillsList');
   try {
-    const data = await api('/api/skills');
+    const endpoint = _ontosynthSkillsScopedModeEnabled() ? '/api/ontosynth/skills/overview' : '/api/skills';
+    const data = await api(endpoint);
+    if (_ontosynthSkillsScopedModeEnabled()) {
+      _skillsData = data || {};
+      renderOntoSynthSkillsOverview(data);
+      return;
+    }
     _skillsData = data.skills || [];
     // Prune collapsed state to only keep categories present in fresh data,
     // avoiding stale keys when categories are renamed or removed server-side.
@@ -3145,6 +3088,10 @@ function _toggleCatCollapse(cat) {
 }
 
 function renderSkills(skills) {
+  if (_ontosynthSkillsScopedModeEnabled()) {
+    renderOntoSynthSkillsOverview(skills);
+    return;
+  }
   const query = ($('skillsSearch').value || '').toLowerCase();
   const filtered = query ? skills.filter(s =>
     (s.name||'').toLowerCase().includes(query) ||
@@ -3185,6 +3132,391 @@ function renderSkills(skills) {
 
 function filterSkills() {
   if (_skillsData) renderSkills(_skillsData);
+}
+
+function _ontosynthSkillsScopedModeEnabled() {
+  return !!window.ONTOSYNTH_WEBUI_SCOPE_ACTIVE;
+}
+
+function _renderOntoSynthSkillSection(title, bodyHtml) {
+  return `<div class="skills-category"><div class="skills-cat-header">${esc(title)}</div><div style="padding:10px 12px">${bodyHtml}</div></div>`;
+}
+
+function _renderOntoSynthSimpleList(items, emptyLabel='—') {
+  if (!Array.isArray(items) || !items.length) return `<div class="skill-desc">${esc(emptyLabel)}</div>`;
+  return items.map(item => `<div class="skill-item" style="cursor:default"><span class="skill-name">${esc(String(item))}</span></div>`).join('');
+}
+
+function _renderOntoSynthKeyValueList(rows) {
+  const filtered = Array.isArray(rows) ? rows.filter(row => row && row.label) : [];
+  if (!filtered.length) return '';
+  return filtered
+    .map(row => `<div class="skill-desc"><strong>${esc(row.label)}:</strong> ${esc(row.value == null ? '—' : String(row.value))}</div>`)
+    .join('');
+}
+
+function _renderOntoSynthDetailSection(title, bodyHtml) {
+  if (!bodyHtml) return '';
+  return (
+    `<div class="skill-linked-files">` +
+    `<div class="ontosynth-detail-section-title" style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin:12px 0 8px">${esc(title)}</div>` +
+    `${bodyHtml}` +
+    `</div>`
+  );
+}
+
+function _renderOntoSynthCollapsibleDetailSection(title, bodyHtml) {
+  if (!bodyHtml) return '';
+  return (
+    `<details class="skill-linked-files ontosynth-detail-section" style="margin-top:12px">` +
+    `<summary class="ontosynth-detail-section-toggle" style="display:flex;align-items:center;justify-content:space-between;gap:12px;cursor:pointer;list-style:none">` +
+    `<span class="ontosynth-detail-section-title" style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">${esc(title)}</span>` +
+    `<span style="font-size:12px;color:var(--muted)"><span class="ontosynth-detail-expand-label">${esc(t('skills_ontosynth_reference_expand'))}</span><span class="ontosynth-detail-collapse-label">${esc(t('skills_ontosynth_reference_collapse'))}</span></span>` +
+    `</summary>` +
+    `<div style="margin-top:10px">${bodyHtml}</div>` +
+    `</details>`
+  );
+}
+
+function _renderOntoSynthRoleCard(role, mode) {
+  const identity = role.runtime_identity || 'unknown';
+  const label = role.display_name || identity;
+  const lines = [];
+  if (mode === 'contract') {
+    lines.push(`<div class="skill-desc">${esc(t('skills_ontosynth_contract_summary', (role.session_preloaded_skill_keys || []).length, role.managed_skill_count || 0, role.allowed_bundled_skill_count || 0))}</div>`);
+    if (Array.isArray(role.session_preloaded_skill_keys) && role.session_preloaded_skill_keys.length) {
+      lines.push(`<div class="skill-desc">${esc(t('skills_ontosynth_preloaded_keys'))}</div>${_renderOntoSynthSimpleList(role.session_preloaded_skill_keys)}`);
+    }
+    if (Array.isArray(role.managed_skill_keys) && role.managed_skill_keys.length) {
+      lines.push(`<div class="skill-desc">${esc(t('skills_ontosynth_managed_contract_keys'))}</div>${_renderOntoSynthSimpleList(role.managed_skill_keys)}`);
+    }
+    if (Array.isArray(role.allowed_bundled_skills) && role.allowed_bundled_skills.length) {
+      lines.push(`<div class="skill-desc">${esc(t('skills_ontosynth_allowed_bundled_skills'))}</div>${_renderOntoSynthSimpleList(role.allowed_bundled_skills)}`);
+    }
+  } else {
+    const v = role.verification || {};
+    lines.push(`<div class="skill-desc">${esc(t('skills_ontosynth_runtime_summary', role.materialized_skill_count || 0, v.actual_local_count || 0, v.actual_builtin_count || 0))}</div>`);
+    if (Array.isArray(role.materialized_skill_names) && role.materialized_skill_names.length) {
+      lines.push(`<div class="skill-desc">${esc(t('skills_ontosynth_materialized_visible_skills'))}</div>${_renderOntoSynthSimpleList(role.materialized_skill_names)}`);
+    }
+    if (Array.isArray(role.contract_managed_only_skill_keys) && role.contract_managed_only_skill_keys.length) {
+      lines.push(`<div class="skill-desc">${esc(t('skills_ontosynth_contract_only_referenced_skills'))}</div>${_renderOntoSynthSimpleList(role.contract_managed_only_skill_keys)}`);
+    }
+  }
+  const detailKey = `role:${mode}:${identity}`;
+  return `<div class="skill-item ontosynth-skill-item" data-ontosynth-skill-detail="${esc(detailKey)}" style="display:block"><div class="skill-name">${esc(label)}</div>${lines.join('')}</div>`;
+}
+
+function _buildOntoSynthSkillDetailIndex(data) {
+  const index = {};
+  const platform = data?.platform_catalog || {};
+  const contract = data?.project_contract || {};
+  const runtime = data?.runtime_materialized || {};
+  const contractRoles = Array.isArray(contract.roles) ? contract.roles : [];
+  const contractRoleByIdentity = Object.fromEntries(
+    contractRoles.map(role => [role.runtime_identity || '', role])
+  );
+
+  for (const skill of (Array.isArray(platform.skills) ? platform.skills : [])) {
+    const key = `platform:${skill.name || ''}`;
+    index[key] = {
+      name: skill.name || t('tab_skills'),
+      content:
+        `# ${skill.name || ''}\n\n` +
+        `${skill.description || ''}\n\n` +
+        `${t('skill_category')}: ${skill.category || '(general)'}`,
+      linked_files: {},
+    };
+  }
+
+  for (const role of contractRoles) {
+    const key = `role:contract:${role.runtime_identity || ''}`;
+    const managedSkills = Array.isArray(role.managed_skills) ? role.managed_skills : [];
+    const managedSkillItems = managedSkills.length
+      ? managedSkills.map(skill => `<div class="skill-item ontosynth-managed-skill-item" data-ontosynth-managed-skill-detail="${esc(`managed:${role.runtime_identity || ''}:${skill.skill_key || ''}`)}"><span class="skill-name">${esc(skill.title || skill.skill_key || '')}</span><span class="skill-desc">${esc(skill.when_to_use || '')}</span></div>`).join('')
+      : `<div class="skill-desc">${esc(t('skills_ontosynth_no_managed_skill_detail'))}</div>`;
+    index[key] = {
+      name: `${role.display_name || role.runtime_identity} · ${t('skills_ontosynth_project_contract')}`,
+      content:
+        `# ${role.display_name || role.runtime_identity}\n\n` +
+        `${t('skills_ontosynth_preloaded_keys')}\n` +
+        `${(role.session_preloaded_skill_keys || []).map(v => `- ${v}`).join('\n') || '-'}\n\n` +
+        `${t('skills_ontosynth_managed_contract_keys')}\n` +
+        `${(role.managed_skill_keys || []).map(v => `- ${v}`).join('\n') || '-'}\n\n` +
+        `${t('skills_ontosynth_allowed_bundled_skills')}\n` +
+        `${(role.allowed_bundled_skills || []).map(v => `- ${v}`).join('\n') || '-'}`,
+      extra_html:
+        `<div class="skill-linked-files">` +
+        `<div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">${esc(t('skills_ontosynth_managed_skill_drilldown'))}</div>` +
+        `${managedSkillItems}` +
+        `</div>`,
+      linked_files: {},
+    };
+
+    for (const skill of managedSkills) {
+      const managedKey = `managed:${role.runtime_identity || ''}:${skill.skill_key || ''}`;
+      const references = Array.isArray(skill.references) ? skill.references : [];
+      const referenceMarkdown = references.length
+        ? references.map(ref =>
+            `## ${ref.title || ref.path || t('linked_files')}\n\n` +
+            `${ref.when_to_load ? `${t('skills_ontosynth_when_to_load')}: ${ref.when_to_load}\n\n` : ''}` +
+            `${ref.content || ''}`
+          ).join('\n\n')
+        : t('skills_ontosynth_no_reference_content');
+      index[managedKey] = {
+        name: `${skill.title || skill.skill_key || ''} · ${role.display_name || role.runtime_identity}`,
+        content:
+          `# ${skill.title || skill.skill_key || ''}\n\n` +
+          `${skill.when_to_use || ''}\n\n` +
+          `${t('skills_ontosynth_workflow')}\n` +
+          `${(skill.workflow || []).map(v => `- ${v}`).join('\n') || '-'}\n\n` +
+          `${t('skills_ontosynth_deliverables')}\n` +
+          `${(skill.deliverables || []).map(v => `- ${v}`).join('\n') || '-'}\n\n` +
+          `${t('skills_ontosynth_success_metrics')}\n` +
+          `${(skill.success_metrics || []).map(v => `- ${v}`).join('\n') || '-'}\n\n` +
+          `${t('skills_ontosynth_skill_references')}\n\n` +
+          `${referenceMarkdown}`,
+        linked_files: {},
+      };
+    }
+  }
+
+  for (const role of (Array.isArray(runtime.profiles) ? runtime.profiles : [])) {
+    const key = `role:runtime:${role.runtime_identity || ''}`;
+    const verification = role.verification || {};
+    const contractRole = contractRoleByIdentity[role.runtime_identity || ''] || {};
+    const managedSkills = Array.isArray(contractRole.managed_skills) ? contractRole.managed_skills : [];
+    const managedSkillByKey = Object.fromEntries(
+      managedSkills.map(skill => [skill.skill_key || '', skill])
+    );
+    const preloadedKeys = new Set(Array.isArray(contractRole.session_preloaded_skill_keys) ? contractRole.session_preloaded_skill_keys : []);
+    const materializedDetails = Array.isArray(role.materialized_skill_details) ? role.materialized_skill_details : [];
+    const materializedDetailByKey = Object.fromEntries(
+      materializedDetails.map(skill => [skill.skill_key || '', skill])
+    );
+    const preloadedDetails = Array.isArray(role.preloaded_skill_details) ? role.preloaded_skill_details : [];
+    const preloadedDetailByKey = Object.fromEntries(
+      preloadedDetails.map(skill => [skill.skill_key || '', skill])
+    );
+    const runtimeSkillItems = Array.isArray(role.materialized_skill_names) && role.materialized_skill_names.length
+      ? role.materialized_skill_names.map(skillName => {
+          const detailKey = `runtime-skill:${role.runtime_identity || ''}:${skillName || ''}`;
+          const managedMatch = managedSkillByKey[skillName || ''];
+          const materializedDetail = materializedDetailByKey[skillName || ''];
+          const preloadedDetail = preloadedDetailByKey[skillName || ''];
+          const desc = managedMatch
+            ? managedMatch.when_to_use || ''
+            : (preloadedDetail
+                ? t('skills_ontosynth_preloaded_runtime_reference')
+                : (materializedDetail
+                    ? t('skills_ontosynth_materialized_runtime_reference')
+                    : (preloadedKeys.has(skillName) ? t('skills_ontosynth_contract_backlink_preloaded') : t('skills_ontosynth_no_contract_backlink'))));
+          return `<div class="skill-item ontosynth-runtime-skill-item" data-ontosynth-runtime-skill-detail="${esc(detailKey)}"><span class="skill-name">${esc(skillName || '')}</span><span class="skill-desc">${esc(desc)}</span></div>`;
+        }).join('')
+      : `<div class="skill-desc">${esc(t('skills_ontosynth_no_runtime_skill_detail'))}</div>`;
+    index[key] = {
+      name: `${role.display_name || role.runtime_identity} · ${t('skills_ontosynth_runtime_materialized')}`,
+      content:
+        `# ${role.display_name || role.runtime_identity}\n\n` +
+        `${t('skills_ontosynth_materialized_visible_skills')}\n` +
+        `${(role.materialized_skill_names || []).map(v => `- ${v}`).join('\n') || '-'}\n\n` +
+        `${t('skills_ontosynth_contract_only_referenced_skills')}\n` +
+        `${(role.contract_managed_only_skill_keys || []).map(v => `- ${v}`).join('\n') || '-'}\n\n` +
+        `Verification\n` +
+        `- ready: ${String(!!verification.ready)}\n` +
+        `- local: ${verification.actual_local_count || 0}/${verification.expected_local_count || 0}\n` +
+        `- builtin: ${verification.actual_builtin_count || 0}/${verification.expected_builtin_count || 0}`,
+      extra_html:
+        `<div class="skill-linked-files">` +
+        `<div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">${esc(t('skills_ontosynth_runtime_skill_drilldown'))}</div>` +
+        `${runtimeSkillItems}` +
+        `</div>`,
+      linked_files: {},
+    };
+
+    for (const skillName of (Array.isArray(role.materialized_skill_names) ? role.materialized_skill_names : [])) {
+      const managedMatch = managedSkillByKey[skillName || ''];
+      const materializedDetail = materializedDetailByKey[skillName || ''];
+      const preloadedDetail = preloadedDetailByKey[skillName || ''];
+      const managedDetailKey = managedMatch ? `managed:${role.runtime_identity || ''}:${managedMatch.skill_key || ''}` : '';
+      const contractBacklinkHtml = managedMatch
+        ? `<div class="skill-item ontosynth-contract-backlink-item" data-ontosynth-contract-backlink-detail="${esc(managedDetailKey)}"><span class="skill-name">${esc(managedMatch.title || managedMatch.skill_key || skillName || '')}</span><span class="skill-desc">${esc(t('skills_ontosynth_contract_backlink_reference'))}</span></div>`
+        : preloadedDetail
+          ? `<div class="skill-desc">${esc(t('skills_ontosynth_preloaded_runtime_reference'))}</div>`
+          : materializedDetail
+            ? `<div class="skill-desc">${esc(t('skills_ontosynth_materialized_runtime_reference'))}</div>`
+          : `<div class="skill-desc">${esc(preloadedKeys.has(skillName) ? t('skills_ontosynth_contract_backlink_preloaded') : t('skills_ontosynth_no_contract_backlink'))}</div>`;
+      index[`runtime-skill:${role.runtime_identity || ''}:${skillName || ''}`] = {
+        name: `${skillName || ''} · ${role.display_name || role.runtime_identity}`,
+        content: (
+          `# ${skillName || ''}\n\n` +
+          `${t('skills_ontosynth_runtime_status')}\n` +
+          `- ready: ${String(!!verification.ready)}\n` +
+          `- local: ${verification.actual_local_count || 0}/${verification.expected_local_count || 0}\n` +
+          `- builtin: ${verification.actual_builtin_count || 0}/${verification.expected_builtin_count || 0}\n` +
+          `- preloaded_visible: ${String((role.contract_preloaded_present || []).includes(skillName))}\n\n` +
+          `${t('skills_ontosynth_contract_backlink')}\n` +
+          `${managedMatch
+            ? `- type: managed\n- key: ${managedMatch.skill_key || skillName}\n- title: ${managedMatch.title || managedMatch.skill_key || skillName}`
+            : preloadedDetail
+              ? `- type: preloaded_runtime_skill\n- key: ${skillName}\n- source: materialized skill`
+              : materializedDetail
+                ? `- type: materialized_runtime_skill\n- key: ${skillName}\n- source: profile skill`
+              : preloadedKeys.has(skillName)
+                ? `- type: preloaded\n- key: ${skillName}`
+                : `- ${t('skills_ontosynth_no_contract_backlink')}`}`
+        ),
+        extra_html:
+          `<div class="skill-linked-files">` +
+          `${_renderOntoSynthKeyValueList([
+            { label: t('skills_ontosynth_runtime_status'), value: verification.ready ? 'ready' : 'not ready' },
+            { label: t('skills_ontosynth_local_verification'), value: `${verification.actual_local_count || 0}/${verification.expected_local_count || 0}` },
+            { label: t('skills_ontosynth_builtin_verification'), value: `${verification.actual_builtin_count || 0}/${verification.expected_builtin_count || 0}` },
+          ])}` +
+          `<div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin:12px 0 8px">${esc(t('skills_ontosynth_contract_backlink'))}</div>` +
+          `${contractBacklinkHtml}` +
+          `</div>` +
+          `${preloadedDetail && preloadedDetail.content
+            ? _renderOntoSynthCollapsibleDetailSection(
+                t('skills_ontosynth_reference_content'),
+                `<div class="main-view-content skill-detail-content">${renderMd(preloadedDetail.content || '')}</div>`
+              )
+            : materializedDetail && materializedDetail.content
+              ? _renderOntoSynthCollapsibleDetailSection(
+                  t('skills_ontosynth_reference_content'),
+                  `<div class="main-view-content skill-detail-content">${renderMd(materializedDetail.content || '')}</div>`
+                )
+              : ''}`,
+        linked_files: preloadedDetail && preloadedDetail.linked_files
+          ? preloadedDetail.linked_files
+          : (materializedDetail && materializedDetail.linked_files ? materializedDetail.linked_files : {}),
+      };
+    }
+  }
+  return index;
+}
+
+function _renderOntoSynthSkillDetail(detail) {
+  if (!detail) return;
+  _currentSkillDetail = { name: detail.name, content: detail.content || '', linked_files: detail.linked_files || {} };
+  _renderSkillDetail(detail.name, detail.content || '', detail.linked_files || {});
+  const body = $('skillDetailBody');
+  if (body && detail.extra_html) {
+    const contentRoot = body.querySelector('.main-view-content');
+    if (contentRoot) {
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = detail.extra_html;
+      contentRoot.appendChild(wrapper);
+      body.querySelectorAll('.ontosynth-managed-skill-item').forEach(el => {
+        el.addEventListener('click', () => openOntoSynthManagedSkillDetail(el.dataset.ontosynthManagedSkillDetail, el));
+      });
+      body.querySelectorAll('.ontosynth-runtime-skill-item').forEach(el => {
+        el.addEventListener('click', () => openOntoSynthRuntimeSkillDetail(el.dataset.ontosynthRuntimeSkillDetail, el));
+      });
+      body.querySelectorAll('.ontosynth-contract-backlink-item').forEach(el => {
+        el.addEventListener('click', () => openOntoSynthManagedSkillDetail(el.dataset.ontosynthContractBacklinkDetail, el));
+      });
+    }
+  }
+}
+
+function openOntoSynthSkillDetail(detailKey, el) {
+  document.querySelectorAll('.skill-item').forEach(e => e.classList.remove('active'));
+  if (el) el.classList.add('active');
+  const detail = _skillsData?.detail_index?.[detailKey];
+  if (!detail) {
+    setStatus(t('skill_load_failed') + detailKey);
+    return;
+  }
+  _renderOntoSynthSkillDetail(detail);
+}
+
+function openOntoSynthManagedSkillDetail(detailKey, el) {
+  document.querySelectorAll('.skill-item').forEach(e => e.classList.remove('active'));
+  if (el) el.classList.add('active');
+  const detail = _skillsData?.detail_index?.[detailKey];
+  if (!detail) {
+    setStatus(t('skill_load_failed') + detailKey);
+    return;
+  }
+  _renderOntoSynthSkillDetail(detail);
+}
+
+function openOntoSynthRuntimeSkillDetail(detailKey, el) {
+  document.querySelectorAll('.skill-item').forEach(e => e.classList.remove('active'));
+  if (el) el.classList.add('active');
+  const detail = _skillsData?.detail_index?.[detailKey];
+  if (!detail) {
+    setStatus(t('skill_load_failed') + detailKey);
+    return;
+  }
+  _renderOntoSynthSkillDetail(detail);
+}
+
+function renderOntoSynthSkillsOverview(data) {
+  const box = $('skillsList');
+  const query = ($('skillsSearch').value || '').toLowerCase();
+  const platform = data?.platform_catalog || {};
+  const contract = data?.project_contract || {};
+  const runtime = data?.runtime_materialized || {};
+  const detailIndex = _buildOntoSynthSkillDetailIndex(data);
+  if (_skillsData && typeof _skillsData === 'object') {
+    _skillsData.detail_index = detailIndex;
+  }
+
+  const platformSkills = Array.isArray(platform.skills) ? platform.skills : [];
+  const filteredPlatform = query
+    ? platformSkills.filter(skill =>
+        (skill.name || '').toLowerCase().includes(query) ||
+        (skill.description || '').toLowerCase().includes(query) ||
+        (skill.category || '').toLowerCase().includes(query)
+      )
+    : platformSkills;
+
+  const contractRoles = Array.isArray(contract.roles) ? contract.roles : [];
+  const filteredContractRoles = query
+    ? contractRoles.filter(role =>
+        JSON.stringify(role).toLowerCase().includes(query)
+      )
+    : contractRoles;
+
+  const runtimeProfiles = Array.isArray(runtime.profiles) ? runtime.profiles : [];
+  const filteredRuntimeProfiles = query
+    ? runtimeProfiles.filter(role =>
+        JSON.stringify(role).toLowerCase().includes(query)
+      )
+    : runtimeProfiles;
+
+  box.innerHTML = [
+    _renderOntoSynthSkillSection(
+      t('skills_ontosynth_platform_catalog'),
+      `<div class="skill-desc">${esc(t('skills_ontosynth_platform_catalog_summary', data?.project_key || 'unknown', platform.skill_count || filteredPlatform.length || 0))}</div>${
+        filteredPlatform.length
+          ? filteredPlatform.map(skill => `<div class="skill-item ontosynth-skill-item" data-ontosynth-skill-detail="${esc(`platform:${skill.name || ''}`)}"><span class="skill-name">${esc(skill.name || '')}</span><span class="skill-desc">${esc(skill.description || '')}</span></div>`).join('')
+          : `<div class="skill-desc">${esc(t('skills_ontosynth_no_platform_match'))}</div>`
+      }`
+    ),
+    _renderOntoSynthSkillSection(
+      t('skills_ontosynth_project_contract'),
+      `<div class="skill-desc">${esc(t('skills_ontosynth_role_count', contract.role_count || filteredContractRoles.length || 0))}</div>${
+        filteredContractRoles.length
+          ? filteredContractRoles.map(role => _renderOntoSynthRoleCard(role, 'contract')).join('')
+          : `<div class="skill-desc">${esc(t('skills_ontosynth_no_contract_match'))}</div>`
+      }`
+    ),
+    _renderOntoSynthSkillSection(
+      t('skills_ontosynth_runtime_materialized'),
+      `<div class="skill-desc">${esc(t('skills_ontosynth_profile_count', runtime.profile_count || filteredRuntimeProfiles.length || 0))}</div>${
+        filteredRuntimeProfiles.length
+          ? filteredRuntimeProfiles.map(role => _renderOntoSynthRoleCard(role, 'runtime')).join('')
+          : `<div class="skill-desc">${esc(t('skills_ontosynth_no_runtime_match'))}</div>`
+      }`
+    ),
+  ].join('');
+
+  box.querySelectorAll('.ontosynth-skill-item').forEach(el => {
+    el.addEventListener('click', () => openOntoSynthSkillDetail(el.dataset.ontosynthSkillDetail, el));
+  });
 }
 
 // Currently selected skill detail — kept across panel switches so re-entering
@@ -5485,20 +5817,13 @@ function _buildPluginCard(plugin){
 
 const _providerCardEls = new Map(); // providerId → {card, statusDot, input, saveBtn, removeBtn}
 
-async function _fetchProviderQuotaStatus(force=false){
-  const endpoint=force?`/api/provider/quota?refresh=1&ts=${Date.now()}`:'/api/provider/quota';
-  const status=await api(endpoint,{cache:'no-store'});
-  if(status&&typeof status==='object') status.client_fetched_at=new Date().toISOString();
-  return status;
-}
-
 async function loadProvidersPanel(){
   const list=$('providersList');
   const empty=$('providersEmpty');
   if(!list) return;
   try{
     const data=await api('/api/providers');
-    const quota=await _fetchProviderQuotaStatus(false).catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||'Quota status unavailable',client_fetched_at:new Date().toISOString()}));
+    const quota=await api('/api/provider/quota').catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||'Quota status unavailable'}));
     const providers=(data.providers||[]).filter(p=>p.configurable||p.is_oauth);
     list.innerHTML='';
     _providerCardEls.clear();
@@ -5517,40 +5842,6 @@ async function loadProvidersPanel(){
   }catch(e){
     list.innerHTML='<div style="color:var(--error);padding:12px;font-size:13px">Failed to load providers: '+e.message+'</div>';
   }
-}
-
-async function _refreshProviderQuota(card,button){
-  if(!card) return;
-  if(button){
-    button.disabled=true;
-    button.textContent='Refreshing…';
-    button.setAttribute('aria-busy','true');
-  }
-  let failed=false;
-  let next;
-  try{
-    next=await _fetchProviderQuotaStatus(true);
-    failed=next&&next.ok===false;
-  }catch(e){
-    failed=true;
-    next={ok:false,status:'unavailable',quota:null,message:e.message||'Quota status unavailable',client_fetched_at:new Date().toISOString()};
-  }
-  try{
-    const fresh=_buildProviderQuotaCard(next);
-    if(fresh){
-      card.replaceWith(fresh);
-      if(typeof showToast==='function') showToast(failed?'Provider usage refresh failed':'Provider usage refreshed');
-      return;
-    }
-  }catch(e){
-    failed=true;
-  }
-  if(card.isConnected&&button){
-    button.disabled=false;
-    button.textContent='Refresh usage';
-    button.removeAttribute('aria-busy');
-  }
-  if(typeof showToast==='function') showToast('Provider usage refresh failed');
 }
 
 function _formatProviderQuotaMoney(value){
@@ -5582,15 +5873,6 @@ function _formatProviderQuotaWindowLabel(accountLimits,w){
     if(raw.toLowerCase()==='weekly') return 'Weekly limit';
   }
   return raw||'Window';
-}
-
-function _formatProviderQuotaLastChecked(status){
-  const accountLimits=status&&status.account_limits;
-  const value=(accountLimits&&accountLimits.fetched_at)||status&&status.client_fetched_at;
-  if(!value) return 'Last checked after refresh';
-  const d=new Date(value);
-  if(Number.isNaN(d.getTime())) return 'Last checked after refresh';
-  try{return 'Last checked '+d.toLocaleString();}catch(e){return 'Last checked '+value;}
 }
 
 function _buildProviderQuotaCard(status){
@@ -5640,17 +5922,11 @@ function _buildProviderQuotaCard(status){
       <div>
         <div class="provider-quota-title">Active provider quota</div>
         <div class="provider-quota-subtitle">${esc(provider)}</div>
-        <div class="provider-quota-checked">${esc(_formatProviderQuotaLastChecked(status))}</div>
       </div>
-      <div class="provider-quota-actions">
-        <span class="provider-quota-badge">${esc(state.replace(/_/g,' '))}</span>
-        <button class="provider-quota-refresh" type="button" data-provider-quota-refresh title="Refresh provider usage limits now">Refresh usage</button>
-      </div>
+      <span class="provider-quota-badge">${esc(state.replace(/_/g,' '))}</span>
     </div>
     <div class="provider-quota-body">${body}</div>
   `;
-  const refreshBtn=card.querySelector('[data-provider-quota-refresh]');
-  if(refreshBtn) refreshBtn.addEventListener('click',()=>_refreshProviderQuota(card,refreshBtn));
   return card;
 }
 

@@ -42,6 +42,143 @@ _STALE_TMP_AGE_SECONDS = 3600  # 1 hour
 # stale baselines while still allowing LOCK to be released before disk I/O.
 _INDEX_WRITE_LOCK = threading.RLock()
 
+# ONTOSYNTH-PROFILE-SCOPE-BEGIN
+def _ontosynth_webui_profile_scope():
+    import json as _json
+    import os as _os
+    from pathlib import Path as _Path
+
+    candidate_paths = []
+    raw_path = _os.getenv("ONTOSYNTH_WEBUI_PROFILE_SCOPE_PATH", "").strip()
+    if raw_path:
+        candidate_paths.append(_Path(raw_path).expanduser())
+    try:
+        module_path = _Path(__file__).resolve()
+        for parent in module_path.parents:
+            candidate_paths.append(parent / ".ontosynth" / "webui_profile_scope.json")
+    except Exception:
+        pass
+    try:
+        cwd = _Path.cwd().resolve()
+        for parent in [cwd, *cwd.parents]:
+            candidate_paths.append(parent / ".ontosynth" / "webui_profile_scope.json")
+    except Exception:
+        pass
+
+    seen = set()
+    for path in candidate_paths:
+        path_key = str(path)
+        if path_key in seen:
+            continue
+        seen.add(path_key)
+        if not path.exists():
+            continue
+        try:
+            payload = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        profile_keys = payload.get("profile_keys") or []
+        if not isinstance(profile_keys, list):
+            continue
+        return payload
+    return None
+
+
+def _ontosynth_webui_scope_allows_name(name):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return True
+    allowed = {str(item) for item in payload.get("profile_keys", [])}
+    if str(name) in allowed:
+        return True
+    return bool(payload.get("include_default_profile")) and str(name) == "default"
+
+
+def _ontosynth_webui_default_active_profile():
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return None
+    profile_keys = payload.get("profile_keys") or []
+    if profile_keys:
+        return str(profile_keys[0])
+    if bool(payload.get("include_default_profile")):
+        return "default"
+    return None
+
+
+def _ontosynth_webui_scoped_profile_keys():
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return []
+    return [str(item) for item in payload.get("profile_keys", []) if str(item).strip()]
+
+
+def _ontosynth_webui_runtime_identity_for_profile(profile_key):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return None
+    for profile in payload.get("profiles", []) or []:
+        if not isinstance(profile, dict):
+            continue
+        if str(profile.get("hermes_profile_key") or "") == str(profile_key):
+            runtime_identity = str(profile.get("runtime_identity") or "").strip()
+            return runtime_identity or None
+    return None
+
+
+def _ontosynth_webui_profile_label(profile_key):
+    runtime_identity = _ontosynth_webui_runtime_identity_for_profile(profile_key)
+    if runtime_identity:
+        return runtime_identity.replace("-", " ").title()
+    return str(profile_key).replace("-", " ").title()
+
+
+def _ontosynth_webui_scope_profile_home(profile_key):
+    from pathlib import Path as _Path
+
+    base_home = _Path.home() / ".hermes"
+    try:
+        base_home = _DEFAULT_HERMES_HOME
+    except NameError:
+        pass
+    if str(profile_key) == "default":
+        return base_home
+    return base_home / "profiles" / str(profile_key)
+
+
+def filter_profiles_for_ontosynth_webui_scope(profiles):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return profiles
+    return [
+        profile
+        for profile in list(profiles or [])
+        if isinstance(profile, dict)
+        and _ontosynth_webui_scope_allows_name(profile.get("name"))
+    ]
+
+
+def filter_assignees_for_ontosynth_webui_scope(assignees):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return assignees
+    filtered = []
+    for assignee in list(assignees or []):
+        name = assignee.get("name") if isinstance(assignee, dict) else assignee
+        counts = assignee.get("counts") if isinstance(assignee, dict) else None
+        if _ontosynth_webui_scope_allows_name(name) or bool(counts):
+            filtered.append(assignee)
+    return filtered
+
+
+def _ontosynth_webui_row_matches_scope_profile(row_profile, active_profile):
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return _profiles_match(row_profile, active_profile)
+    allowed = set(_ontosynth_webui_scoped_profile_keys())
+    row = str(row_profile or "default")
+    return row in allowed or (row == "default" and bool(payload.get("include_default_profile")))
+# ONTOSYNTH-PROFILE-SCOPE-END
 
 def _cleanup_stale_tmp_files() -> None:
     """Best-effort removal of stale ``*.tmp.*`` files from SESSION_DIR.
@@ -1807,6 +1944,332 @@ def get_cli_session_messages(sid) -> list:
         return []
     return msgs
 
+# ONTOSYNTH-SCOPED-SESSIONS-BEGIN
+_ontosynth_webui_original_get_cli_sessions = get_cli_sessions
+_ontosynth_webui_original_get_cli_session_messages = get_cli_session_messages
+
+
+def _ontosynth_webui_state_db_targets():
+    scoped_profiles = _ontosynth_webui_scoped_profile_keys()
+    if not scoped_profiles:
+        return []
+    targets = []
+    for profile_key in _ontosynth_webui_scoped_profile_keys():
+        targets.append((
+            str(profile_key),
+            _ontosynth_webui_scope_profile_home(profile_key) / "state.db",
+        ))
+    return targets
+
+
+def _ontosynth_webui_cron_project_for_profile(profile_key, profile_home):
+    def _cron_pid():
+        try:
+            return ensure_cron_project()
+        except Exception:
+            return None
+    return _cron_pid
+
+
+def _ontosynth_webui_optional_sql_col(name, columns, fallback="NULL"):
+    return f"s.{name}" if name in columns else f"{fallback} AS {name}"
+
+
+def _ontosynth_webui_source_metadata(source):
+    raw = str(source or "").strip().lower() or "cli"
+    if raw == "cli":
+        return {"raw_source": "cli", "session_source": "cli", "source_label": "CLI"}
+    if raw == "cron":
+        return {"raw_source": "cron", "session_source": "cron", "source_label": "Cron"}
+    if raw == "webui":
+        return {"raw_source": "webui", "session_source": "webui", "source_label": "WebUI"}
+    return {
+        "raw_source": None if raw == "unknown" else raw,
+        "session_source": "other",
+        "source_label": raw.replace("_", " ").title() if raw != "unknown" else "Agent",
+    }
+
+
+def _ontosynth_webui_read_agent_session_rows_from_db(db_path, limit):
+    import sqlite3 as _sqlite3
+    from contextlib import closing as _closing
+
+    if not db_path.exists():
+        return []
+    try:
+        with _closing(_sqlite3.connect(str(db_path))) as conn:
+            conn.row_factory = _sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(sessions)")
+            session_cols = {str(row["name"]) for row in cur.fetchall()}
+            cur.execute("PRAGMA table_info(messages)")
+            message_cols = {str(row["name"]) for row in cur.fetchall()}
+            if "source" not in session_cols:
+                return []
+            user_message_count_expr = (
+                "COUNT(CASE WHEN LOWER(m.role) = 'user' THEN 1 END)"
+                if "role" in message_cols
+                else "COUNT(m.id)"
+            )
+            selected = [
+                "s.id",
+                "s.title",
+                "s.model",
+                "s.message_count",
+                "s.started_at",
+                "s.source",
+                _ontosynth_webui_optional_sql_col("user_id", session_cols),
+                _ontosynth_webui_optional_sql_col("chat_id", session_cols),
+                _ontosynth_webui_optional_sql_col("chat_type", session_cols),
+                _ontosynth_webui_optional_sql_col("thread_id", session_cols),
+                _ontosynth_webui_optional_sql_col("session_key", session_cols),
+                _ontosynth_webui_optional_sql_col("origin_chat_id", session_cols),
+                _ontosynth_webui_optional_sql_col("origin_user_id", session_cols),
+                _ontosynth_webui_optional_sql_col("platform", session_cols),
+                _ontosynth_webui_optional_sql_col("parent_session_id", session_cols),
+                _ontosynth_webui_optional_sql_col("ended_at", session_cols),
+                _ontosynth_webui_optional_sql_col("end_reason", session_cols),
+                "COUNT(m.id) AS actual_message_count",
+                f"{user_message_count_expr} AS actual_user_message_count",
+                "MAX(m.timestamp) AS last_activity",
+            ]
+            cur.execute(
+                "SELECT " + ", ".join(selected)
+                + " FROM sessions s"
+                + " LEFT JOIN messages m ON m.session_id = s.id"
+                + " WHERE s.source IS NOT NULL"
+                + " GROUP BY s.id"
+                + " HAVING COUNT(m.id) > 0"
+                + " ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+    except Exception:
+        return []
+
+    try:
+        from api.agent_sessions import _project_agent_session_rows
+
+        rows = _project_agent_session_rows(rows)
+    except Exception:
+        pass
+    if limit is None:
+        return rows
+    return rows[:max(0, int(limit))]
+
+
+def _ontosynth_webui_read_cli_session_messages_from_db(db_path, sid):
+    import sqlite3 as _sqlite3
+    from contextlib import closing as _closing
+
+    if not db_path.exists():
+        return []
+    try:
+        with _closing(_sqlite3.connect(str(db_path))) as conn:
+            conn.row_factory = _sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(messages)")
+            available = {str(row["name"]) for row in cur.fetchall()}
+            required = {"role", "content", "timestamp"}
+            if not required.issubset(available):
+                return []
+            optional = [
+                "tool_call_id",
+                "tool_calls",
+                "tool_name",
+                "reasoning",
+                "reasoning_details",
+                "codex_reasoning_items",
+                "reasoning_content",
+                "codex_message_items",
+            ]
+            selected = ["role", "content", "timestamp"] + [
+                col for col in optional if col in available
+            ]
+            cur.execute(
+                "SELECT " + ", ".join(selected)
+                + " FROM messages WHERE session_id = ? ORDER BY timestamp ASC",
+                (sid,),
+            )
+            messages = []
+            for row in cur.fetchall():
+                message = {
+                    "role": row["role"],
+                    "content": row["content"],
+                    "timestamp": row["timestamp"],
+                }
+                row_keys = row.keys()
+                for col in optional:
+                    if col not in row_keys:
+                        continue
+                    value = row[col]
+                    if value in (None, ""):
+                        continue
+                    if col in {
+                        "tool_calls",
+                        "reasoning_details",
+                        "codex_reasoning_items",
+                        "codex_message_items",
+                    }:
+                        value = _json_loads_if_string(value)
+                    message[col] = value
+                if message.get("role") == "tool" and message.get("tool_name") and not message.get("name"):
+                    message["name"] = message["tool_name"]
+                messages.append(message)
+            return messages
+    except Exception:
+        return []
+
+
+def _ontosynth_webui_is_generated_profile(profile_key):
+    return str(profile_key or "").startswith("os-")
+
+
+def _ontosynth_webui_generated_session_title_prefix(profile_key):
+    profile_label = _ontosynth_webui_profile_label(profile_key).strip()
+    return f"{profile_label} Session "
+
+
+def _ontosynth_webui_filter_generated_role_duplicates(cli_sessions):
+    latest_generated = {}
+    passthrough = []
+    for row in list(cli_sessions or []):
+        if not isinstance(row, dict):
+            continue
+        profile = str(row.get("profile") or "")
+        if not _ontosynth_webui_is_generated_profile(profile):
+            passthrough.append(row)
+            continue
+        current = latest_generated.get(profile)
+        current_ts = (
+            current.get("last_message_at") or current.get("updated_at", 0) or 0
+            if isinstance(current, dict)
+            else 0
+        )
+        row_ts = row.get("last_message_at") or row.get("updated_at", 0) or 0
+        if current is None or row_ts >= current_ts:
+            latest_generated[profile] = row
+    merged = passthrough + list(latest_generated.values())
+    merged.sort(
+        key=lambda row: row.get("last_message_at") or row.get("updated_at", 0) or 0,
+        reverse=True,
+    )
+    return merged
+
+
+def get_cli_sessions() -> list:
+    targets = _ontosynth_webui_state_db_targets()
+    if not targets:
+        return _ontosynth_webui_original_get_cli_sessions()
+
+    cli_sessions = []
+    try:
+        cli_sessions.extend(get_claude_code_sessions())
+    except Exception:
+        logger.debug("Claude Code session scan failed", exc_info=True)
+
+    for profile_key, db_path in targets:
+        if not db_path.exists():
+            continue
+        profile_home = db_path.parent
+        cron_pid = _ontosynth_webui_cron_project_for_profile(profile_key, profile_home)
+        try:
+            rows = _ontosynth_webui_read_agent_session_rows_from_db(
+                db_path,
+                CLI_VISIBLE_SESSION_LIMIT,
+            )
+            for row in rows:
+                sid = row["id"]
+                raw_ts = row["last_activity"] or row["started_at"]
+                profile = str(profile_key)
+                source = row["source"] or "cli"
+                title = row["title"]
+                if not title and source == "cron" and sid.startswith("cron_"):
+                    parts = sid.split("_")
+                    if len(parts) >= 3:
+                        job_id = parts[1]
+                        try:
+                            jobs_path = profile_home / "cron" / "jobs.json"
+                            if jobs_path.exists():
+                                import json as _json
+
+                                jobs_data = _json.loads(jobs_path.read_text())
+                                for job in jobs_data.get("jobs", []):
+                                    if job.get("id") == job_id:
+                                        title = job.get("name") or title
+                                        break
+                        except Exception:
+                            pass
+                try:
+                    webui_meta = Session.load_metadata_only(sid)
+                    if webui_meta and getattr(webui_meta, "title", None):
+                        title = webui_meta.title
+                except Exception:
+                    pass
+                source_metadata = _ontosynth_webui_source_metadata(source)
+                profile_label = _ontosynth_webui_profile_label(profile_key)
+                display_title = title or f"{profile_label} Session {sid}"
+                cli_sessions.append({
+                    "session_id": sid,
+                    "title": display_title,
+                    "workspace": str(get_last_workspace()),
+                    "model": row["model"] or None,
+                    "message_count": row["message_count"] or row["actual_message_count"] or 0,
+                    "created_at": row["started_at"],
+                    "updated_at": raw_ts,
+                    "last_message_at": raw_ts,
+                    "pinned": False,
+                    "archived": False,
+                    "project_id": cron_pid() if is_cron_session(sid, source) else None,
+                    "profile": profile,
+                    "source_tag": source,
+                    "raw_source": source_metadata.get("raw_source"),
+                    "user_id": row.get("user_id"),
+                    "chat_id": row.get("chat_id") or row.get("origin_chat_id"),
+                    "chat_type": row.get("chat_type"),
+                    "thread_id": row.get("thread_id"),
+                    "session_key": row.get("session_key"),
+                    "platform": row.get("platform"),
+                    "session_source": source_metadata.get("session_source"),
+                    "source_label": source_metadata.get("source_label"),
+                    "parent_session_id": row.get("parent_session_id"),
+                    "parent_title": row.get("parent_title"),
+                    "parent_source": row.get("parent_source"),
+                    "relationship_type": row.get("relationship_type"),
+                    "_parent_lineage_root_id": row.get("_parent_lineage_root_id"),
+                    "end_reason": row.get("end_reason"),
+                    "actual_message_count": row.get("actual_message_count"),
+                    "user_message_count": row.get("actual_user_message_count"),
+                    "_lineage_root_id": row.get("_lineage_root_id"),
+                    "_lineage_tip_id": row.get("_lineage_tip_id"),
+                    "_compression_segment_count": row.get("_compression_segment_count"),
+                    "is_cli_session": True,
+                })
+        except Exception as err:
+            logger.warning(
+                "Scoped get_cli_sessions() failed for %s (%s): %s",
+                profile_key,
+                db_path,
+                err,
+            )
+    cli_sessions.sort(
+        key=lambda row: row.get("last_message_at") or row.get("updated_at", 0) or 0,
+        reverse=True,
+    )
+    return _ontosynth_webui_filter_generated_role_duplicates(cli_sessions)
+
+
+def get_cli_session_messages(sid) -> list:
+    targets = _ontosynth_webui_state_db_targets()
+    if not targets:
+        return _ontosynth_webui_original_get_cli_session_messages(sid)
+    if str(sid or "").startswith(f"{CLAUDE_CODE_SOURCE}_"):
+        return get_claude_code_session_messages(sid)
+    for _profile_key, db_path in targets:
+        messages = _ontosynth_webui_read_cli_session_messages_from_db(db_path, sid)
+        if messages:
+            return messages
+    return []
+# ONTOSYNTH-SCOPED-SESSIONS-END
 
 def count_conversation_rounds(sid: str, since: float | None = None) -> int:
     """Count conversation rounds for a session from state.db.
