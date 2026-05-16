@@ -56,7 +56,10 @@ function syncAppTitlebar() {
   if (panel === 'chat' && typeof S !== 'undefined' && S && S.session) {
     mainText = S.session.title || (typeof t === 'function' ? t('untitled') : 'Untitled');
     const vis = Array.isArray(S.messages) ? S.messages.filter(m => m && m.role && m.role !== 'tool') : [];
-    if (typeof t === 'function') subText = t('n_messages', vis.length);
+    const displayCount = Number.isFinite(Number(S.session.visible_message_count))
+      ? Number(S.session.visible_message_count)
+      : vis.length;
+    if (typeof t === 'function') subText = t('n_messages', displayCount);
     if (S.session.is_cli_session) sourceLabel = S.session.source_label || S.session.source_tag || S.session.raw_source || '';
   } else {
     const key = APP_TITLEBAR_KEYS[panel];
@@ -228,6 +231,7 @@ async function switchPanel(name, opts = {}) {
       mainEl.classList.toggle('showing-' + p, nextPanel === p);
     });
   }
+  syncAppTitlebar();
   // Lazy-load panel data
   if (nextPanel === 'tasks') await loadCrons();
   if (nextPanel === 'kanban') await loadKanban();

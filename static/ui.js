@@ -4025,7 +4025,10 @@ function syncTopbar(){
   const _topbarMeta=$('topbarMeta');
   if(_topbarMeta){
     const sourceLabel=(S.session&&S.session.is_cli_session&&(S.session.source_label||S.session.source_tag||S.session.raw_source))||'';
-    const metaText=t('n_messages',vis.length);
+    const displayCount=Number.isFinite(Number(S.session.visible_message_count))
+      ? Number(S.session.visible_message_count)
+      : vis.length;
+    const metaText=t('n_messages',displayCount);
     _topbarMeta.textContent=metaText;
     if(sourceLabel){
       const badge=document.createElement('span');
@@ -4274,7 +4277,7 @@ function ensureActivityGroup(inner, opts){
     group.setAttribute('data-agent-activity-group','1');
     if(activityKey) group.setAttribute('data-activity-disclosure-key',activityKey);
     if(live) group.setAttribute('data-live-tool-call-group','1');
-    group.innerHTML=`<button type="button" class="tool-call-group-summary" aria-expanded="${collapsed?'false':'true'}" onclick="_toggleActivityGroup(this)"><span class="tool-call-group-chevron">${li('chevron-right',12)}</span><span class="tool-call-group-label">Activity</span><span class="tool-call-group-duration"></span></button><div class="tool-call-group-body"></div>`;
+    group.innerHTML=`<button type="button" class="tool-call-group-summary" aria-expanded="${collapsed?'false':'true'}" onclick="_toggleActivityGroup(this)"><span class="tool-call-group-chevron">${li('chevron-right',12)}</span><span class="tool-call-group-label">Activity</span><span class="tool-call-group-preview"></span><span class="tool-call-group-duration"></span></button><div class="tool-call-group-body"></div>`;
     const anchor=opts.anchor||null;
     if(anchor&&anchor.parentElement===inner) anchor.insertAdjacentElement('afterend', group);
     else inner.appendChild(group);
@@ -4947,6 +4950,7 @@ function renderMessages(options){
   );
   let _prevSepKey=null;
   let currentAssistantTurn=null;
+  let previousRenderedRawIdx=null;
   const assistantSegments=new Map();
   const assistantThinking=new Map();
   const userRows=new Map();
@@ -4954,6 +4958,8 @@ function renderMessages(options){
   // for(let vi=0;vi<visWithIdx.length;vi++)
   for(let vi=0;vi<renderVisWithIdx.length;vi++){
     const {m,rawIdx}=renderVisWithIdx[vi];
+    const hasHiddenRawGap=previousRenderedRawIdx!==null&&rawIdx>previousRenderedRawIdx+1;
+    if(hasHiddenRawGap) currentAssistantTurn=null;
     const _tsSep=m._ts||m.timestamp;
     if(_tsSep){
       const _d=new Date(_tsSep*1000);
@@ -5056,6 +5062,7 @@ function renderMessages(options){
       row.innerHTML=`${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`;
       inner.appendChild(row);
       userRows.set(rawIdx, row);
+      previousRenderedRawIdx=rawIdx;
       continue;
     }
 
@@ -5091,6 +5098,7 @@ function renderMessages(options){
     }
     _assistantTurnBlocks(currentAssistantTurn).appendChild(seg);
     assistantSegments.set(rawIdx, seg);
+    previousRenderedRawIdx=rawIdx;
   }
 
   function _insertCompressionLikeNode(node, anchorIndex){
@@ -5511,10 +5519,16 @@ function _syncToolCallGroupSummary(group){
   const cards=Array.from(group.querySelectorAll('.tool-card-row .tool-card'));
   const toolCount=cards.length;
   const label=group.querySelector('.tool-call-group-label');
+  const previewEl=group.querySelector('.tool-call-group-preview');
   const durationEl=group.querySelector('.tool-call-group-duration');
   if(label){
     if(toolCount) label.textContent=`Activity: ${toolCount} tool${toolCount===1?'':'s'}`;
     else label.textContent='Activity';
+  }
+  if(previewEl){
+    const preview=_activitySummaryPreview(group);
+    previewEl.textContent=preview;
+    previewEl.style.display=preview?'':'none';
   }
   if(durationEl){
     if(group.getAttribute('data-live-tool-call-group')==='1'){
@@ -5529,6 +5543,27 @@ function _syncToolCallGroupSummary(group){
       durationEl.style.display=durationText?'':'none';
     }
   }
+}
+
+function _activityPreviewSnippet(text, limit=120){
+  const clean=String(text||'').replace(/\s+/g,' ').trim();
+  if(!clean) return '';
+  if(clean.length<=limit) return clean;
+  const cutoff=clean.slice(0,limit);
+  const lastBreak=Math.max(cutoff.lastIndexOf('. '), cutoff.lastIndexOf('; '), cutoff.lastIndexOf(' '));
+  return `${(lastBreak>40?cutoff.slice(0,lastBreak):cutoff).trim()}…`;
+}
+
+function _activitySummaryPreview(group){
+  if(!group) return '';
+  const thinkingNode=group.querySelector('.agent-activity-thinking .thinking-card-body pre');
+  const thinkingPreview=_activityPreviewSnippet(thinkingNode&&thinkingNode.textContent||'');
+  if(thinkingPreview) return thinkingPreview;
+  const toolPreviewNode=group.querySelector('.tool-card-preview');
+  const toolPreview=_activityPreviewSnippet(toolPreviewNode&&toolPreviewNode.textContent||'');
+  if(toolPreview) return toolPreview;
+  const toolNameNode=group.querySelector('.tool-card-name');
+  return _activityPreviewSnippet(toolNameNode&&toolNameNode.textContent||'', 80);
 }
 
 // ── Live tool card helpers (called during SSE streaming) ──

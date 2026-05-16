@@ -18,7 +18,11 @@ from api.config import (
     get_effective_default_model, _get_session_agent_lock,
 )
 from api.workspace import get_last_workspace
-from api.agent_sessions import read_importable_agent_session_rows, read_session_lineage_metadata
+from api.agent_sessions import (
+    _connect_readonly_sqlite,
+    read_importable_agent_session_rows,
+    read_session_lineage_metadata,
+)
 
 logger = logging.getLogger(__name__)
 CLI_VISIBLE_SESSION_LIMIT = 20
@@ -430,8 +434,13 @@ def _read_metadata_json_prefix(path, max_prefix_bytes=65536):
 
 def _lookup_index_message_count(session_id):
     """Return the indexed message count without loading the full session file."""
+    return _lookup_index_message_count_from_file(SESSION_INDEX_FILE, session_id)
+
+
+def _lookup_index_message_count_from_file(index_file: Path, session_id):
+    """Return the indexed message count from an explicit session index file."""
     try:
-        entries = json.loads(SESSION_INDEX_FILE.read_text(encoding='utf-8'))
+        entries = json.loads(index_file.read_text(encoding='utf-8'))
     except Exception:
         return None
     if not isinstance(entries, list):
@@ -448,6 +457,39 @@ def _lookup_index_message_count(session_id):
             return None
         return count if count >= 0 else None
     return None
+
+
+def _session_path_for_dir(session_dir: Path, session_id: str) -> Path:
+    return session_dir / f'{session_id}.json'
+
+
+def _load_session_from_path(path: Path, metadata_only: bool = False):
+    if not path.exists():
+        return None
+    if metadata_only:
+        try:
+            prefix = _read_metadata_json_prefix(path)
+            if not prefix:
+                return _load_session_from_path(path, metadata_only=False)
+            parsed = json.loads(prefix)
+            needed = {'session_id', 'title', 'created_at', 'updated_at'}
+            if not needed.issubset(parsed.keys()):
+                return _load_session_from_path(path, metadata_only=False)
+            parsed['messages'] = []
+            parsed['tool_calls'] = []
+            session = Session(**parsed)
+            session._metadata_message_count = _lookup_index_message_count_from_file(
+                path.parent / '_index.json',
+                parsed.get('session_id'),
+            )
+            session._loaded_metadata_only = True
+            return session
+        except Exception:
+            return _load_session_from_path(path, metadata_only=False)
+    try:
+        return Session(**json.loads(path.read_text(encoding='utf-8')))
+    except Exception:
+        return None
 
 
 class Session:
@@ -645,10 +687,7 @@ class Session:
         # Validate session ID format to prevent path traversal
         if not sid or not all(c in '0123456789abcdefghijklmnopqrstuvwxyz_' for c in sid):
             return None
-        p = SESSION_DIR / f'{sid}.json'
-        if not p.exists():
-            return None
-        return cls(**json.loads(p.read_text(encoding='utf-8')))
+        return _load_session_from_path(_session_path_for_dir(SESSION_DIR, sid), metadata_only=False)
 
     @classmethod
     def load_metadata_only(cls, sid):
@@ -661,32 +700,7 @@ class Session:
         """
         if not sid or not all(c in '0123456789abcdefghijklmnopqrstuvwxyz_' for c in sid):
             return None
-        p = SESSION_DIR / f'{sid}.json'
-        if not p.exists():
-            return None
-        try:
-            prefix = _read_metadata_json_prefix(p)
-            if not prefix:
-                return cls.load(sid)
-            parsed = json.loads(prefix)
-            needed = {'session_id', 'title', 'created_at', 'updated_at'}
-            if not needed.issubset(parsed.keys()):
-                return cls.load(sid)
-            parsed['messages'] = []
-            parsed['tool_calls'] = []
-            session = cls(**parsed)
-            session._metadata_message_count = _lookup_index_message_count(sid)
-            # Mark this session as a metadata-only stub. save() refuses to write
-            # such a session because doing so would atomically replace the
-            # on-disk JSON with messages=[], wiping the conversation. Any
-            # caller that needs to mutate persisted state on a metadata-only
-            # session must reload it with metadata_only=False first.
-            # See #1558 — v0.50.279 _clear_stale_stream_state() data-loss bug.
-            session._loaded_metadata_only = True
-            return session
-        except Exception:
-            # Corrupt prefix or decode error — fall back to full load
-            return cls.load(sid)
+        return _load_session_from_path(_session_path_for_dir(SESSION_DIR, sid), metadata_only=True)
 
     def compact(self, include_runtime=False, active_stream_ids=None) -> dict:
         active_stream_ids = active_stream_ids if active_stream_ids is not None else set()
@@ -1015,14 +1029,27 @@ def get_session(sid, metadata_only=False):
     """
     with LOCK:
         if sid in SESSIONS:
-            SESSIONS.move_to_end(sid)  # LRU: mark as recently used
-            return SESSIONS[sid]
+            cached = SESSIONS[sid]
+            if metadata_only or not getattr(cached, '_loaded_metadata_only', False):
+                SESSIONS.move_to_end(sid)  # LRU: mark as recently used
+                return cached
+            SESSIONS.pop(sid, None)
     if metadata_only:
         s = Session.load_metadata_only(sid)
         if s:
             return s
     else:
         s = Session.load(sid)
+    if not s:
+        for session_dir in _ontosynth_webui_session_dir_targets():
+            if session_dir == SESSION_DIR:
+                continue
+            s = _load_session_from_path(
+                _session_path_for_dir(session_dir, sid),
+                metadata_only=metadata_only,
+            )
+            if s:
+                break
     if s:
         with LOCK:
             SESSIONS[sid] = s
@@ -1110,6 +1137,35 @@ def _hide_from_default_sidebar(session: dict) -> bool:
     return source == 'cron' or sid.startswith('cron_')
 
 
+def _ontosynth_webui_session_dir_targets() -> list[Path]:
+    """Return session sidecar directories visible to the OntoSynth scoped WebUI."""
+    targets = [SESSION_DIR]
+    scoped_profiles = _ontosynth_webui_scoped_profile_keys()
+    if not scoped_profiles:
+        return targets
+    try:
+        from api.profiles import _DEFAULT_HERMES_HOME
+
+        targets.append(_DEFAULT_HERMES_HOME / 'webui' / 'sessions')
+    except Exception:
+        targets.append(HOME / '.hermes' / 'webui' / 'sessions')
+    for profile_key in scoped_profiles:
+        targets.append(_ontosynth_webui_scope_profile_home(profile_key) / 'webui' / 'sessions')
+    deduped = []
+    seen = set()
+    for path in targets:
+        try:
+            resolved = path.expanduser().resolve()
+        except Exception:
+            resolved = path.expanduser()
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(resolved)
+    return deduped
+
+
 def _active_state_db_path() -> Path:
     """Return state.db for the active Hermes profile, degrading to HERMES_HOME."""
     try:
@@ -1118,6 +1174,92 @@ def _active_state_db_path() -> Path:
     except Exception:
         hermes_home = Path(os.getenv('HERMES_HOME', str(HOME / '.hermes'))).expanduser().resolve()
     return hermes_home / 'state.db'
+
+
+def _index_entry_exists_in_dir(session_dir: Path, session_id: str, in_memory_ids=None) -> bool:
+    if not session_id:
+        return False
+    if in_memory_ids is None:
+        in_memory_ids = set()
+    if session_id in in_memory_ids:
+        return True
+    return _session_path_for_dir(session_dir, session_id).exists()
+
+
+def _collect_session_rows_from_dir(
+    session_dir: Path,
+    active_stream_ids,
+    *,
+    include_in_memory: bool = False,
+):
+    session_index_file = session_dir / '_index.json'
+    in_memory_ids = set(SESSIONS.keys()) if include_in_memory else set()
+    if session_index_file.exists():
+        try:
+            index = json.loads(session_index_file.read_text(encoding='utf-8'))
+            index = [
+                s for s in index
+                if _index_entry_exists_in_dir(session_dir, s.get('session_id'), in_memory_ids)
+            ]
+            for i, s in enumerate(index):
+                if 'last_message_at' not in s:
+                    full = _load_session_from_path(
+                        _session_path_for_dir(session_dir, s.get('session_id')),
+                        metadata_only=False,
+                    )
+                    if full:
+                        index[i] = full.compact()
+            for s in index:
+                s['is_streaming'] = _is_streaming_session(
+                    s.get('active_stream_id'),
+                    active_stream_ids,
+                )
+            index_map = {s['session_id']: s for s in index if s.get('session_id')}
+            if include_in_memory:
+                with LOCK:
+                    for s in SESSIONS.values():
+                        index_map[s.session_id] = s.compact(
+                            include_runtime=True,
+                            active_stream_ids=active_stream_ids,
+                        )
+            result = sorted(
+                index_map.values(),
+                key=lambda s: (s.get('pinned', False), _session_sort_timestamp(s)),
+                reverse=True,
+            )
+            return [
+                s for s in result if not (
+                    s.get('title', 'Untitled') == 'Untitled'
+                    and s.get('message_count', 0) == 0
+                    and not s.get('active_stream_id')
+                    and not s.get('has_pending_user_message')
+                    and not s.get('worktree_path')
+                )
+            ]
+        except Exception:
+            logger.debug("Failed to load session index from %s, falling back to scan", session_index_file)
+    out = []
+    for p in session_dir.glob('*.json'):
+        if p.name.startswith('_'):
+            continue
+        s = _load_session_from_path(p, metadata_only=False)
+        if s:
+            out.append(s)
+    if include_in_memory:
+        for s in SESSIONS.values():
+            if all(s.session_id != x.session_id for x in out):
+                out.append(s)
+    out.sort(key=lambda s: (getattr(s, 'pinned', False), _session_sort_timestamp(s)), reverse=True)
+    return [
+        s.compact(include_runtime=True, active_stream_ids=active_stream_ids)
+        for s in out if not (
+            s.title == 'Untitled'
+            and len(s.messages) == 0
+            and not s.active_stream_id
+            and not s.pending_user_message
+            and not getattr(s, 'worktree_path', None)
+        )
+    ]
 
 
 def _enrich_sidebar_lineage_metadata(sessions: list[dict]) -> None:
@@ -1146,6 +1288,34 @@ def _diag_stage(diag, name: str) -> None:
 def all_sessions(diag=None):
     _diag_stage(diag, "all_sessions.active_streams")
     active_stream_ids = _active_stream_ids()
+    session_dir_targets = _ontosynth_webui_session_dir_targets()
+    if len(session_dir_targets) > 1:
+        merged = {}
+        for session_dir in session_dir_targets:
+            rows = _collect_session_rows_from_dir(
+                session_dir,
+                active_stream_ids,
+                include_in_memory=(session_dir == SESSION_DIR),
+            )
+            for row in rows:
+                sid = row.get('session_id')
+                if not sid:
+                    continue
+                current = merged.get(sid)
+                if current is None or _session_sort_timestamp(row) >= _session_sort_timestamp(current):
+                    merged[sid] = row
+        result = sorted(
+            merged.values(),
+            key=lambda s: (s.get('pinned', False), _session_sort_timestamp(s)),
+            reverse=True,
+        )
+        result = [s for s in result if not _hide_from_default_sidebar(s)]
+        for s in result:
+            if not s.get('profile'):
+                s['profile'] = 'default'
+        _diag_stage(diag, "all_sessions.lineage_metadata")
+        _enrich_sidebar_lineage_metadata(result)
+        return result
     # Phase C: try index first for O(1) read; fall back to full scan
     _diag_stage(diag, "all_sessions.index_exists")
     if SESSION_INDEX_FILE.exists():
@@ -1852,7 +2022,7 @@ def get_cli_session_messages(sid) -> list:
         return []
 
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(_connect_readonly_sqlite(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(messages)")
@@ -1997,7 +2167,7 @@ def _ontosynth_webui_read_agent_session_rows_from_db(db_path, limit):
     if not db_path.exists():
         return []
     try:
-        with _closing(_sqlite3.connect(str(db_path))) as conn:
+        with _closing(_connect_readonly_sqlite(db_path)) as conn:
             conn.row_factory = _sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")
@@ -2064,7 +2234,7 @@ def _ontosynth_webui_read_cli_session_messages_from_db(db_path, sid):
     if not db_path.exists():
         return []
     try:
-        with _closing(_sqlite3.connect(str(db_path))) as conn:
+        with _closing(_connect_readonly_sqlite(db_path)) as conn:
             conn.row_factory = _sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(messages)")

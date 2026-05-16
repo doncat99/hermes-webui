@@ -119,27 +119,26 @@ def test_668_hermes_home_probe_before_workspace():
 
 # ── #579: topbar message count already filters tool messages ──────────────────
 
-def test_579_topbar_filters_tool_messages():
-    """ui.js topbar count must filter out role='tool' messages (#579).
+def test_579_topbar_prefers_server_visible_message_count_before_loaded_window():
+    """ui.js topbar count must use the session-level visible-message truth when present.
 
-    The sidebar previously showed raw message_count (which included tool
-    messages), causing a mismatch with the topbar. PR #584 removed the
-    sidebar count display entirely; the topbar was already correct.
-    This test locks in the existing topbar filter so it can't regress.
+    Paginated CLI sessions only load a tail window on first open. Counting
+    `S.messages` directly under-reports the conversation until the operator
+    scrolls back. The topbar should prefer a server-provided visible total and
+    only fall back to the loaded window when that field is absent.
     """
     # Find the topbarMeta assignment
     meta_pos = UI_JS.find("topbarMeta")
     assert meta_pos != -1, "topbarMeta assignment not found in ui.js"
 
-    # Find the filter that precedes it — should exclude role==='tool'
-    context = UI_JS[max(0, meta_pos - 400):meta_pos + 100]
-    assert "role" in context and "tool" in context, (
-        "topbarMeta count must filter by role — "
-        "messages with role='tool' must be excluded from the displayed count"
+    display_count_pos = UI_JS.find("const displayCount", meta_pos)
+    assert display_count_pos != -1, "topbarMeta displayCount computation not found"
+    context = UI_JS[max(0, display_count_pos - 200):display_count_pos + 500]
+    assert "visible_message_count" in context, (
+        "topbarMeta must prefer the server-computed visible message count when available"
     )
-    # The filter must exclude tool messages (not include them)
-    assert "!=='tool'" in context or "!= 'tool'" in context or "role!=='tool'" in context, (
-        "topbar count filter must use !== 'tool' to exclude tool messages"
+    assert "!=='tool'" in UI_JS or "!= 'tool'" in UI_JS or "role!=='tool'" in UI_JS, (
+        "topbar fallback must still filter tool messages when visible_message_count is absent"
     )
 
 

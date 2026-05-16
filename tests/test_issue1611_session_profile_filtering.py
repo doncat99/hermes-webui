@@ -163,7 +163,10 @@ def test_keep_latest_messaging_runs_after_profile_filter():
     next_handler = src.find('parsed.path == "/api/projects":', handler_idx)
     block = src[handler_idx:next_handler]
 
-    filter_idx = block.find('_profiles_match(s.get("profile"), active_profile)')
+    filter_idx = max(
+        block.find('_profiles_match(s.get("profile"), active_profile)'),
+        block.find('_ontosynth_webui_row_matches_scope_profile(s.get("profile"), active_profile)'),
+    )
     dedupe_idx = block.find('_keep_latest_messaging_session_per_source(scoped)')
     assert filter_idx > 0, "Profile filter not found in /api/sessions handler"
     assert dedupe_idx > 0, "Messaging dedupe must run on the scoped list"
@@ -172,6 +175,92 @@ def test_keep_latest_messaging_runs_after_profile_filter():
         "after lets the dedupe discard the active profile's row when both "
         "profiles share a messaging identity (Opus pre-release SHOULD-FIX #2)"
     )
+
+
+def test_all_profiles_does_not_pre_scope_webui_sessions_to_active_profile():
+    """Scoped OntoSynth WebUI must honor ?all_profiles=1 for WebUI-owned rows too.
+
+    Regression shape: the handler pre-filtered ``webui_sessions`` to the active
+    profile before it even looked at ``all_profiles``. That made the aggregate
+    view rely only on CLI state.db rows, so profiles with historical WebUI JSON
+    sessions but empty profile state.db rows disappeared from the Chat tab.
+    """
+    from pathlib import Path
+
+    repo_root = Path(__file__).parent.parent
+    src = (repo_root / 'api' / 'routes.py').read_text(encoding='utf-8')
+
+    handler_idx = src.find('parsed.path == "/api/sessions":')
+    assert handler_idx > 0
+    next_handler = src.find('parsed.path == "/api/projects":', handler_idx)
+    block = src[handler_idx:next_handler]
+
+    assert "if not all_profiles:" in block, (
+        "Scoped WebUI rows must only be pre-filtered to the active profile in "
+        "the default mode, not when ?all_profiles=1 is requested."
+    )
+    assert "if all_profiles:\n                    merged = _ontosynth_webui_filter_generated_role_duplicates(merged)" in block, (
+        "Aggregate scoped view must still dedupe generated role sessions after "
+        "preserving cross-profile WebUI rows."
+    )
+    assert "and not all_profiles" in block, (
+        "Aggregate scoped view must not drop WebUI-owned os-* rows merely "
+        "because the current profile state.db no longer carries them."
+    )
+
+
+def test_scoped_sessions_keep_latest_webui_snapshot_for_missing_generated_role(monkeypatch):
+    """Default scoped view should keep a role visible when CLI state vanished.
+
+    Regression shape: a generated role profile can temporarily have no usable
+    CLI ``state.db`` row (for example zero-byte state.db), while an older WebUI
+    snapshot still exists. The default scoped Chat tab should preserve the
+    newest snapshot for that role instead of hiding the role entirely.
+    """
+    import api.routes as routes
+
+    payload = {
+        "profile_keys": [
+            "os-project-manager",
+            "os-knowledge-steward",
+        ],
+        "include_default_profile": False,
+    }
+    monkeypatch.setattr(routes, "_ontosynth_webui_profile_scope", lambda: payload)
+
+    rows = routes._ontosynth_webui_latest_scope_fallback_rows(
+        [
+            {
+                "session_id": "pm-live",
+                "profile": "os-project-manager",
+                "updated_at": 30,
+            },
+            {
+                "session_id": "ks-older",
+                "profile": "os-knowledge-steward",
+                "updated_at": 10,
+            },
+            {
+                "session_id": "ks-latest",
+                "profile": "os-knowledge-steward",
+                "updated_at": 20,
+            },
+        ],
+        {
+            "pm-live": {
+                "session_id": "pm-live",
+                "profile": "os-project-manager",
+            }
+        },
+    )
+
+    assert rows == [
+        {
+            "session_id": "ks-latest",
+            "profile": "os-knowledge-steward",
+            "updated_at": 20,
+        }
+    ]
 
 
 # ── SHOULD-FIX #1: client filter must NOT strict-equality-reject server cross-aliased rows ──

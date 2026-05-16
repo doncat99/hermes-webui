@@ -5,6 +5,7 @@ from contextlib import closing
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+SQLITE_READ_TIMEOUT_SECONDS = 1.0
 
 
 MESSAGING_SOURCES = {
@@ -130,6 +131,30 @@ def _count_user_turns(row: dict) -> int:
     return _as_positive_int(user_turns)
 
 
+def _connect_readonly_sqlite(db_path: Path, *, timeout: float = SQLITE_READ_TIMEOUT_SECONDS) -> sqlite3.Connection:
+    """Open a read-only sqlite connection that degrades quickly under lock contention."""
+    conn = sqlite3.connect(
+        f"file:{Path(db_path).expanduser().resolve()}?mode=ro",
+        uri=True,
+        timeout=timeout,
+    )
+    conn.execute(f"PRAGMA busy_timeout = {max(1, int(timeout * 1000))}")
+    return conn
+
+
+def _count_visible_messages(row: dict) -> int:
+    """Return a non-zero message count for imported JSON sessions when possible."""
+    message_count = row.get("actual_message_count")
+    if message_count is None:
+        message_count = row.get("message_count")
+    if message_count is None:
+        messages = row.get("messages") or []
+        if isinstance(messages, list):
+            return len(messages)
+        return 0
+    return _as_positive_int(message_count)
+
+
 def _has_cli_lineage(row: dict) -> bool:
     segment_count = _as_positive_int(row.get("_compression_segment_count"))
     return segment_count > 1 or bool(row.get("_lineage_root_id"))
@@ -170,7 +195,7 @@ def is_cli_session_row_visible(row: dict) -> bool:
     if not is_cli_session_row(row):
         return True
 
-    message_count = _as_positive_int(row.get("actual_message_count") or row.get("message_count"))
+    message_count = _count_visible_messages(row)
     if message_count <= 0:
         return False
 
@@ -361,7 +386,7 @@ def read_importable_agent_session_rows(
         return []
 
     log = log or logger
-    with closing(sqlite3.connect(str(db_path))) as conn:
+    with closing(_connect_readonly_sqlite(db_path)) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
@@ -490,7 +515,7 @@ def read_session_lineage_report(db_path: Path, session_id: str | None, max_hops:
         return _empty_lineage_report(sid)
 
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(_connect_readonly_sqlite(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")
@@ -620,7 +645,7 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
         return {}
 
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
+        with closing(_connect_readonly_sqlite(db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")

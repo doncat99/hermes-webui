@@ -30,6 +30,7 @@ from api.agent_sessions import (
     read_session_lineage_report,
 )
 from api.compression_anchor import visible_messages_for_anchor
+from api.models import _ontosynth_webui_filter_generated_role_duplicates
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +218,45 @@ def _ontosynth_webui_row_matches_scope_profile(row_profile, active_profile):
     allowed = set(_ontosynth_webui_scoped_profile_keys())
     row = str(row_profile or "default")
     return row in allowed or (row == "default" and bool(payload.get("include_default_profile")))
+
+
+def _ontosynth_webui_latest_scope_fallback_rows(webui_sessions, cli_by_id):
+    """Keep the newest scoped WebUI row for generated roles missing from CLI state.
+
+    OntoSynth role profiles can temporarily lose their Hermes ``state.db`` truth
+    surface, for example when a profile has not been re-materialized yet or the
+    local state file is empty. In that case the scoped Chat tab should still keep
+    the newest WebUI/imported snapshot for that role instead of hiding the role
+    entirely from the operator surface.
+    """
+    payload = _ontosynth_webui_profile_scope()
+    if not payload:
+        return []
+    allowed = {str(item) for item in payload.get("profile_keys", []) if str(item).strip()}
+    if not allowed:
+        return []
+    live_profiles = {
+        str((row or {}).get("profile") or "")
+        for row in (cli_by_id or {}).values()
+        if isinstance(row, dict)
+    }
+    latest_by_profile = {}
+    for row in list(webui_sessions or []):
+        if not isinstance(row, dict):
+            continue
+        profile = str(row.get("profile") or "")
+        if not profile or profile not in allowed or profile in live_profiles:
+            continue
+        current = latest_by_profile.get(profile)
+        current_ts = (
+            current.get("last_message_at") or current.get("updated_at", 0) or 0
+            if isinstance(current, dict)
+            else 0
+        )
+        row_ts = row.get("last_message_at") or row.get("updated_at", 0) or 0
+        if current is None or row_ts >= current_ts:
+            latest_by_profile[profile] = row
+    return list(latest_by_profile.values())
 # ONTOSYNTH-PROFILE-SCOPE-END
 
 def _all_profiles_query_flag(parsed_url) -> bool:
@@ -3536,9 +3576,10 @@ def handle_get(handler, parsed) -> bool:
             s = get_session(sid, metadata_only=(not load_messages))
             _clear_stale_stream_state(s)
             cli_meta = _lookup_cli_session_metadata(sid)
+            is_cli_session = is_cli_session_row(cli_meta) if cli_meta else False
             is_messaging_session = _is_messaging_session_record(s) or _is_messaging_session_record(cli_meta)
             cli_messages = []
-            if is_messaging_session:
+            if is_messaging_session or is_cli_session:
                 cli_messages = get_cli_session_messages(sid)
             _t2 = _time.monotonic()
             effective_model = (
@@ -3552,47 +3593,46 @@ def handle_get(handler, parsed) -> bool:
                 else None
             )
             _t3 = _time.monotonic()
-            if load_messages:
-                if is_messaging_session and cli_messages:
-                    sidecar_messages = getattr(s, "messages", []) or []
-                    # Recovery/aggregate sidecars can intentionally contain a
-                    # longer visible conversation than the single state.db
-                    # segment for this messaging session id. Prefer the longer
-                    # sidecar so repaired WebUI history is not hidden behind the
-                    # canonical per-segment transcript. When both sources carry
-                    # different slices of the same stitched conversation, merge
-                    # them chronologically and dedupe exact repeats.
-                    if sidecar_messages and sidecar_messages != cli_messages:
-                        merged_messages = []
-                        seen_message_keys = set()
-                        for msg in sorted(list(cli_messages) + list(sidecar_messages), key=lambda m: (
-                            float(m.get("timestamp") or 0),
-                            str(m.get("role") or ""),
-                            str(m.get("content") or ""),
-                        )):
-                            message_identity = msg.get("id") or msg.get("message_id")
-                            if message_identity:
-                                key = ("message_id", str(message_identity))
-                            else:
-                                key = (
-                                    "legacy",
-                                    str(msg.get("role") or ""),
-                                    str(msg.get("content") or ""),
-                                    str(msg.get("timestamp") or ""),
-                                    str(msg.get("tool_call_id") or ""),
-                                    str(msg.get("tool_name") or msg.get("name") or ""),
-                                )
-                            if key in seen_message_keys:
-                                continue
-                            seen_message_keys.add(key)
-                            merged_messages.append(msg)
-                        _all_msgs = merged_messages
-                    else:
-                        _all_msgs = sidecar_messages if len(sidecar_messages) > len(cli_messages) else cli_messages
+            sidecar_messages = getattr(s, "messages", []) or []
+            if not load_messages and not cli_messages and not sidecar_messages:
+                try:
+                    sidecar_messages = getattr(get_session(sid, metadata_only=False), "messages", []) or []
+                except Exception:
+                    sidecar_messages = []
+            if cli_messages:
+                # CLI-backed sessions can have sidecars that are longer than the
+                # current state.db segment (recovery stitching, imported local
+                # copies, or WebUI-only additions). Prefer the longer source and
+                # merge when both contain distinct slices of the same transcript.
+                if sidecar_messages and sidecar_messages != cli_messages:
+                    merged_messages = []
+                    seen_message_keys = set()
+                    for msg in sorted(list(cli_messages) + list(sidecar_messages), key=lambda m: (
+                        float(m.get("timestamp") or 0),
+                        str(m.get("role") or ""),
+                        str(m.get("content") or ""),
+                    )):
+                        message_identity = msg.get("id") or msg.get("message_id")
+                        if message_identity:
+                            key = ("message_id", str(message_identity))
+                        else:
+                            key = (
+                                "legacy",
+                                str(msg.get("role") or ""),
+                                str(msg.get("content") or ""),
+                                str(msg.get("timestamp") or ""),
+                                str(msg.get("tool_call_id") or ""),
+                                str(msg.get("tool_name") or msg.get("name") or ""),
+                            )
+                        if key in seen_message_keys:
+                            continue
+                        seen_message_keys.add(key)
+                        merged_messages.append(msg)
+                    _all_msgs = merged_messages
                 else:
-                    _all_msgs = s.messages
+                    _all_msgs = sidecar_messages if len(sidecar_messages) > len(cli_messages) else cli_messages
             else:
-                _all_msgs = []
+                _all_msgs = sidecar_messages if sidecar_messages else (s.messages if load_messages else [])
             if load_messages:
                 if msg_before is not None:
                     # Scroll-to-top paging: msg_before is a 0-based index into
@@ -3609,6 +3649,10 @@ def handle_get(handler, parsed) -> bool:
                     _truncated_msgs = _all_msgs
             else:
                 _truncated_msgs = _all_msgs
+            _visible_message_count = sum(
+                1 for msg in _all_msgs
+                if isinstance(msg, dict) and str(msg.get("role") or "") and str(msg.get("role") or "") != "tool"
+            )
             # Resolve effective context_length with model-metadata fallback so
             # older sessions (pre-#1318) that have context_length=0 persisted
             # still render a meaningful indicator on load.  Mirrors the
@@ -3666,6 +3710,7 @@ def handle_get(handler, parsed) -> bool:
                         pass
             raw = s.compact() | {
                 "messages": _truncated_msgs,
+                "visible_message_count": _visible_message_count,
                 "tool_calls": getattr(s, "tool_calls", []) if load_messages else [],
                 "active_stream_id": getattr(s, "active_stream_id", None),
                 "pending_user_message": getattr(s, "pending_user_message", None),
@@ -3721,6 +3766,10 @@ def handle_get(handler, parsed) -> bool:
                     "workspace": (cli_meta or {}).get("workspace", ""),
                     "model": (cli_meta or {}).get("model", "unknown"),
                     "message_count": len(msgs),
+                    "visible_message_count": sum(
+                        1 for msg in msgs
+                        if isinstance(msg, dict) and str(msg.get("role") or "") and str(msg.get("role") or "") != "tool"
+                    ),
                     "created_at": (cli_meta or {}).get("created_at", 0),
                     "updated_at": (cli_meta or {}).get("updated_at", 0),
                     "last_message_at": (cli_meta or {}).get("last_message_at")
@@ -3798,11 +3847,22 @@ def handle_get(handler, parsed) -> bool:
             diag.stage("load_settings")
             settings = load_settings()
             show_cli_sessions = bool(settings.get("show_cli_sessions")) or bool(_ontosynth_webui_scoped_profile_keys())
+            all_profiles = _all_profiles_query_flag(parsed)
             if show_cli_sessions:
                 diag.stage("get_cli_sessions")
                 cli = get_cli_sessions()
                 diag.stage("merge_cli_sessions")
                 cli_by_id = {s["session_id"]: s for s in cli}
+                scoped_fallback_ids = set()
+                if _ontosynth_webui_scoped_profile_keys() and not all_profiles:
+                    scoped_fallback_ids = {
+                        str(row.get("session_id"))
+                        for row in _ontosynth_webui_latest_scope_fallback_rows(
+                            webui_sessions,
+                            cli_by_id,
+                        )
+                        if isinstance(row, dict) and row.get("session_id")
+                    }
                 for s in webui_sessions:
                     meta = cli_by_id.get(s.get("session_id"))
                     if not meta:
@@ -3821,8 +3881,10 @@ def handle_get(handler, parsed) -> bool:
                     s for s in webui_sessions
                     if not (
                         _ontosynth_webui_scoped_profile_keys()
+                        and not all_profiles
                         and str(s.get("profile") or "").startswith("os-")
                         and s.get("session_id") not in cli_by_id
+                        and s.get("session_id") not in scoped_fallback_ids
                     )
                 ]
                 webui_sessions = [s for s in webui_sessions if is_cli_session_row_visible(s)]
@@ -3856,19 +3918,21 @@ def handle_get(handler, parsed) -> bool:
             diag.stage("active_profile")
             from api.profiles import get_active_profile_name
             active_profile = get_active_profile_name()
-            all_profiles = _all_profiles_query_flag(parsed)
             if show_cli_sessions and _ontosynth_webui_scoped_profile_keys():
-                webui_sessions = [
-                    s for s in webui_sessions
-                    if _ontosynth_webui_row_matches_scope_profile(
-                        s.get("profile"), active_profile
-                    )
-                ]
+                if not all_profiles:
+                    webui_sessions = [
+                        s for s in webui_sessions
+                        if _ontosynth_webui_row_matches_scope_profile(
+                            s.get("profile"), active_profile
+                        )
+                    ]
                 merged = webui_sessions + deduped_cli
                 merged.sort(
                     key=lambda s: s.get("last_message_at") or s.get("updated_at", 0) or 0,
                     reverse=True,
                 )
+                if all_profiles:
+                    merged = _ontosynth_webui_filter_generated_role_duplicates(merged)
             diag.stage("profile_filter")
             if all_profiles:
                 scoped = merged

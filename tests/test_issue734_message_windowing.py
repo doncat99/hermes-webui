@@ -31,6 +31,19 @@ def test_windowed_render_keeps_streaming_and_tool_activity_anchored_to_rendered_
     assert "const seg=assistantSegments.get(mi);" in UI_JS
 
 
+def test_windowed_render_breaks_assistant_turns_when_hidden_raw_gap_exists():
+    assert "let previousRenderedRawIdx=null;" in UI_JS, (
+        "renderMessages() should track the previous rendered raw message index."
+    )
+    assert "const hasHiddenRawGap=previousRenderedRawIdx!==null&&rawIdx>previousRenderedRawIdx+1;" in UI_JS, (
+        "renderMessages() must detect hidden raw-message gaps between visible transcript entries."
+    )
+    assert "if(hasHiddenRawGap) currentAssistantTurn=null;" in UI_JS, (
+        "A hidden raw-message gap should break the current assistant turn so "
+        "tool-heavy sessions do not collapse multiple turns into one message."
+    )
+
+
 def test_window_state_participates_in_cache_and_cached_button_is_rewired():
     assert "cached.renderWindowSize===renderWindowSize" in UI_JS
     assert "_sessionHtmlCache.set(sid,{html:_html,msgCount,renderWindowSize})" in UI_JS

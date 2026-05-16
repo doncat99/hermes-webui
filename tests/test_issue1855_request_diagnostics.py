@@ -6,6 +6,8 @@ import api.models as models
 from api.models import Session
 from api.request_diagnostics import RequestDiagnostics
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 class _StageRecorder:
     def __init__(self):
@@ -52,6 +54,7 @@ def test_all_sessions_reports_internal_index_stages(tmp_path, monkeypatch):
     index_file = session_dir / "_index.json"
     monkeypatch.setattr(models, "SESSION_DIR", session_dir)
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", index_file)
+    monkeypatch.setattr(models, "_ontosynth_webui_session_dir_targets", lambda: [session_dir])
     monkeypatch.setattr(models, "_enrich_sidebar_lineage_metadata", lambda sessions: None)
     models.SESSIONS.clear()
 
@@ -92,7 +95,7 @@ def test_all_sessions_reports_internal_index_stages(tmp_path, monkeypatch):
 
 
 def test_issue1855_target_routes_are_wired_to_diagnostics():
-    src = Path("api/routes.py").read_text(encoding="utf-8")
+    src = (ROOT / "api" / "routes.py").read_text(encoding="utf-8")
 
     assert 'RequestDiagnostics.maybe_start("GET", parsed.path' in src
     assert "all_sessions(diag=diag)" in src
@@ -108,3 +111,25 @@ def test_issue1855_target_routes_are_wired_to_diagnostics():
         "response_write",
     ):
         assert stage in src
+
+
+def test_issue1855_session_reads_use_readonly_sqlite_helper():
+    models_src = (ROOT / "api" / "models.py").read_text(encoding="utf-8")
+    agent_src = (ROOT / "api" / "agent_sessions.py").read_text(encoding="utf-8")
+
+    assert "mode=ro" in agent_src
+    assert "PRAGMA busy_timeout" in agent_src
+
+    for fn_name in (
+        "get_cli_session_messages",
+        "_ontosynth_webui_read_agent_session_rows_from_db",
+        "_ontosynth_webui_read_cli_session_messages_from_db",
+    ):
+        start = models_src.find(f"def {fn_name}")
+        assert start >= 0, f"{fn_name} definition missing"
+        end = models_src.find("\ndef ", start + 1)
+        block = models_src[start:end if end > start else None]
+        assert "_connect_readonly_sqlite(db_path)" in block, (
+            f"{fn_name} must use the read-only short-timeout sqlite helper "
+            "so /api/sessions degrades quickly under contention"
+        )

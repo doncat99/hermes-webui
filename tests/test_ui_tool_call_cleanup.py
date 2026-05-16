@@ -124,6 +124,10 @@ class TestToolCallGroupingStatic:
             "Tool-card detail rows should live inside a group body that can be "
             "expanded/collapsed."
         )
+        assert "tool-call-group-preview" in helper, (
+            "Collapsed groups should expose a preview span so tool-heavy turns "
+            "are still understandable before expansion."
+        )
         assert "aria-expanded" in helper, (
             "The expand/collapse control must expose aria-expanded."
         )
@@ -150,6 +154,22 @@ class TestToolCallGroupingStatic:
         )
         assert "Activity: thinking +" not in sync_fn, (
             "When tools are present, thinking is expected and should not be repeated in the label."
+        )
+
+    def test_activity_summary_derives_preview_from_thinking_or_tool_output(self):
+        sync_fn = _function_body(UI_JS, "_syncToolCallGroupSummary")
+        preview_fn = _function_body(UI_JS, "_activitySummaryPreview")
+        assert "tool-call-group-preview" in sync_fn, (
+            "Activity summary sync should populate the preview slot."
+        )
+        assert "_activitySummaryPreview(group)" in sync_fn, (
+            "Activity summary sync should derive preview text from the rendered group."
+        )
+        assert "thinking-card-body pre" in preview_fn, (
+            "Thinking text should be considered first for collapsed Activity previews."
+        )
+        assert "tool-card-preview" in preview_fn, (
+            "Tool-card previews should backfill the collapsed Activity summary when no thinking text exists."
         )
 
     def test_live_tool_cards_use_grouping_only_when_simplified(self):
