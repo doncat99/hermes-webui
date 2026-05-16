@@ -1327,9 +1327,48 @@ function _kanbanEmptyBoardHtml(){
   return `<div class="main-view-empty"><div class="main-view-empty-title">${esc(t('kanban_no_data'))}</div><div class="main-view-empty-sub">${esc(t('kanban_work_queue_hint'))}</div></div>`;
 }
 
+function _kanbanScrollKeyFor(el, index){
+  if (!el) return `board:${index}`;
+  try {
+    const lane = el.closest('[data-kanban-lane]');
+    if (lane) return `lane:${lane.getAttribute('data-kanban-lane') || index}`;
+  } catch(_) {}
+  return `board:${index}`;
+}
+
+function _kanbanScrollContainers(){
+  const board = $('kanbanBoard');
+  if (!board) return [];
+  try {
+    const nested = Array.from(board.querySelectorAll('.kanban-board.kanban-board-in-lane'));
+    if (nested.length) return nested;
+  } catch(_) {}
+  return [board];
+}
+
+function _kanbanCaptureScrollState(){
+  return _kanbanScrollContainers().map((el, index) => ({
+    key: _kanbanScrollKeyFor(el, index),
+    left: Number(el && el.scrollLeft ? el.scrollLeft : 0),
+  }));
+}
+
+function _kanbanRestoreScrollState(snapshot){
+  if (!Array.isArray(snapshot) || !snapshot.length) return;
+  const byKey = new Map(snapshot.map(item => [item.key, Number(item.left || 0)]));
+  _kanbanScrollContainers().forEach((el, index) => {
+    const key = _kanbanScrollKeyFor(el, index);
+    if (!byKey.has(key)) return;
+    const left = byKey.get(key);
+    if (!Number.isFinite(left)) return;
+    el.scrollLeft = left;
+  });
+}
+
 function _kanbanRenderBoard(){
   const board = $('kanbanBoard');
   if (!board) return;
+  const scrollState = _kanbanCaptureScrollState();
   if (!_kanbanBoard || !_kanbanBoard.columns) {
     board.innerHTML = _kanbanEmptyBoardHtml();
     return;
@@ -1343,6 +1382,7 @@ function _kanbanRenderBoard(){
     return;
   }
   board.innerHTML = _kanbanLanesByProfile ? _kanbanRenderProfileLanes(columns) : columns.map(_kanbanRenderColumn).join('');
+  _kanbanRestoreScrollState(scrollState);
 }
 
 function _kanbanCard(task, status){

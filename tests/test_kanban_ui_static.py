@@ -814,7 +814,13 @@ const html = vm.runInContext(`_kanbanRenderTaskDetail({
 })`, context);
 console.log(JSON.stringify({html}));
 """
-    result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    result = subprocess.run(
+        ["node", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
     html = json.loads(result.stdout)["html"]
     assert "worker log" in html
     assert "kanban-back-btn" in html
@@ -1042,6 +1048,26 @@ def test_kanban_sse_refresh_is_debounced():
     assert "}, 250)" in PANELS
 
 
+def test_kanban_refresh_preserves_horizontal_scroll_position():
+    """Live refresh must not snap the board back to the far-left column.
+
+    The current regression happens because patchKanbanView() calls
+    _kanbanRenderBoard(), which rebuilds `.kanban-board-in-lane` and resets
+    scrollLeft to 0. The renderer must capture horizontal scroll state before
+    replacing DOM and restore it afterward, keyed by lane identity.
+    """
+    assert "function _kanbanCaptureScrollState()" in PANELS
+    assert "function _kanbanRestoreScrollState(snapshot)" in PANELS
+    assert ".kanban-board.kanban-board-in-lane" in PANELS
+    assert "data-kanban-lane" in PANELS
+
+    render_body = re.search(r"function _kanbanRenderBoard\(\)\{(.*?)\n\}", PANELS, re.DOTALL)
+    assert render_body, "Missing _kanbanRenderBoard()"
+    body = render_body.group(1)
+    assert "const scrollState = _kanbanCaptureScrollState();" in body
+    assert "_kanbanRestoreScrollState(scrollState);" in body
+
+
 def test_kanban_board_color_is_validated_against_css_injection():
     """`board.color` is interpolated into a `style=""` attribute on the
     switcher icon. esc() escapes HTML but does NOT prevent CSS-context
@@ -1086,7 +1112,13 @@ const results = cases.map(([input, expected]) => ({
 }));
 console.log(JSON.stringify(results));
 """
-    result = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    result = subprocess.run(
+        ["node", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
     results = json.loads(result.stdout)
     failures = [r for r in results if r["actual"] != r["expected"]]
     assert not failures, f"_kanbanSafeColor mismatches: {failures}"
