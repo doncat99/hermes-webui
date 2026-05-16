@@ -1916,6 +1916,41 @@ from api.agent_health import build_agent_health_payload
 from api.request_diagnostics import RequestDiagnostics
 from api.system_health import build_system_health_payload
 
+_STATIC_ROOT = (Path(__file__).parent.parent / "static").resolve()
+
+
+def _webui_asset_version_token() -> str:
+    """Return a live cache-bust token for the current shell asset set."""
+    from api.updates import WEBUI_VERSION
+
+    newest_mtime_ns = 0
+    for asset_name in (
+        "index.html",
+        "style.css",
+        "boot.js",
+        "ui.js",
+        "messages.js",
+        "sessions.js",
+        "panels.js",
+        "commands.js",
+        "icons.js",
+        "i18n.js",
+        "workspace.js",
+        "terminal.js",
+        "onboarding.js",
+        "login.js",
+        "sw.js",
+    ):
+        try:
+            asset_mtime_ns = (_STATIC_ROOT / asset_name).stat().st_mtime_ns
+        except OSError:
+            continue
+        if asset_mtime_ns > newest_mtime_ns:
+            newest_mtime_ns = asset_mtime_ns
+    if newest_mtime_ns <= 0:
+        return WEBUI_VERSION
+    return f"{WEBUI_VERSION}-{newest_mtime_ns:x}"
+
 
 def _kanban_unknown_endpoint(handler, parsed, method: str) -> bool:
     """Return a Kanban-specific 404 for stale clients/obsolete endpoint shapes."""
@@ -3933,8 +3968,7 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path in ("/", "/index.html") or parsed.path.startswith("/session/"):
         try:
             from urllib.parse import quote
-            from api.updates import WEBUI_VERSION
-            version_token = quote(WEBUI_VERSION, safe="")
+            version_token = quote(_webui_asset_version_token(), safe="")
             from api.extensions import inject_extension_tags
 
             html = _INDEX_HTML_PATH.read_text(encoding="utf-8").replace("__WEBUI_VERSION__", version_token)
@@ -3954,8 +3988,7 @@ def handle_get(handler, parsed) -> bool:
             _resolve_login_locale_key(_lang)
         ]
         from urllib.parse import quote
-        from api.updates import WEBUI_VERSION
-        version_token = quote(WEBUI_VERSION, safe="")
+        version_token = quote(_webui_asset_version_token(), safe="")
         _page = (
             _LOGIN_PAGE_HTML.replace("{{BOT_NAME}}", _bn)
             .replace("{{BOT_NAME_INITIAL}}", _bn[0].upper())
@@ -3984,8 +4017,7 @@ def handle_get(handler, parsed) -> bool:
         return j(handler, {"auth_enabled": is_auth_enabled(), "logged_in": logged_in})
 
     if parsed.path in ("/manifest.json", "/manifest.webmanifest"):
-        static_root = Path(__file__).parent.parent / "static"
-        manifest_path = (static_root / "manifest.json").resolve()
+        manifest_path = (_STATIC_ROOT / "manifest.json").resolve()
         if manifest_path.exists():
             data = manifest_path.read_bytes()
             handler.send_response(200)
@@ -3998,14 +4030,10 @@ def handle_get(handler, parsed) -> bool:
         return j(handler, {"error": "not found"}, status=404)
 
     if parsed.path == "/sw.js":
-        static_root = Path(__file__).parent.parent / "static"
-        sw_path = (static_root / "sw.js").resolve()
+        sw_path = (_STATIC_ROOT / "sw.js").resolve()
         if sw_path.exists():
-            # Inject the current git-derived version as the cache name so the
-            # service worker cache busts automatically on every new deploy.
             from urllib.parse import quote
-            from api.updates import WEBUI_VERSION
-            version_token = quote(WEBUI_VERSION, safe="")
+            version_token = quote(_webui_asset_version_token(), safe="")
             text = sw_path.read_text(encoding="utf-8").replace(
                 "__WEBUI_VERSION__", version_token
             )
@@ -4021,8 +4049,7 @@ def handle_get(handler, parsed) -> bool:
         return j(handler, {"error": "not found"}, status=404)
 
     if parsed.path == "/favicon.ico":
-        static_root = Path(__file__).parent.parent / "static"
-        ico_path = (static_root / "favicon.ico").resolve()
+        ico_path = (_STATIC_ROOT / "favicon.ico").resolve()
         if ico_path.exists() and ico_path.is_file():
             data = ico_path.read_bytes()
             handler.send_response(200)

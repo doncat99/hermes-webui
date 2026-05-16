@@ -3,6 +3,8 @@ from __future__ import annotations
 import os, stat, subprocess, sys
 from pathlib import Path
 
+from api.config import PYTHON_EXE
+
 # Credential files that should never be world-readable
 _SENSITIVE_FILES = (
     '.env',
@@ -88,6 +90,57 @@ def _trusted_agent_dir(agent_dir: Path) -> bool:
         return False
 
 
+def _runtime_probe_env(agent_dir: Path | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    if agent_dir is not None:
+        pythonpath_parts = [str(agent_dir)]
+        existing_pythonpath = env.get("PYTHONPATH", "").strip()
+        if existing_pythonpath:
+            pythonpath_parts.append(existing_pythonpath)
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+    return env
+
+
+def _python_can_import_agent_runtime(python_exe: str, agent_dir: Path | None = None) -> bool:
+    if not python_exe:
+        return False
+    try:
+        result = subprocess.run(
+            [python_exe, "-c", "import run_agent"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_runtime_probe_env(agent_dir),
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+def ensure_server_runtime_python(
+    *,
+    current_python: str | None = None,
+    target_python: str | None = None,
+    agent_dir: Path | None = None,
+    server_script: Path | str | None = None,
+    argv: list[str] | None = None,
+) -> bool:
+    current = str(current_python or sys.executable or "").strip()
+    target = str(target_python or PYTHON_EXE or "").strip()
+    if not current or not target:
+        return False
+    if _python_can_import_agent_runtime(current, agent_dir):
+        return False
+    if current == target:
+        return False
+    if not _python_can_import_agent_runtime(target, agent_dir):
+        return False
+    script_path = Path(server_script or sys.argv[0]).resolve()
+    cli_args = list(argv if argv is not None else sys.argv)
+    os.execv(target, [target, str(script_path), *cli_args[1:]])
+    return True
+
+
 def auto_install_agent_deps() -> bool:
     enabled = os.environ.get('HERMES_WEBUI_AUTO_INSTALL', '').strip().lower() in ('1', 'true', 'yes')
     if not enabled:
@@ -103,16 +156,22 @@ def auto_install_agent_deps() -> bool:
     req_file = agent_dir / 'requirements.txt'
     pyproject = agent_dir / 'pyproject.toml'
     if req_file.exists():
-        install_args = [sys.executable, '-m', 'pip', 'install', '--quiet', '-r', str(req_file)]
+        install_args = [PYTHON_EXE, '-m', 'pip', 'install', '--quiet', '-r', str(req_file)]
         print(f'     Installing from {req_file} ...', flush=True)
     elif pyproject.exists():
-        install_args = [sys.executable, '-m', 'pip', 'install', '--quiet', str(agent_dir)]
+        install_args = [PYTHON_EXE, '-m', 'pip', 'install', '--quiet', str(agent_dir)]
         print(f'     Installing from {agent_dir} (pyproject.toml) ...', flush=True)
     else:
         print('[!!] Auto-install skipped: no requirements.txt or pyproject.toml in agent dir.', flush=True)
         return False
     try:
-        result = subprocess.run(install_args, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(
+            install_args,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=_runtime_probe_env(agent_dir),
+        )
         if result.returncode != 0:
             print(f'[!!] pip install failed (exit {result.returncode}):', flush=True)
             for line in (result.stderr or '').splitlines()[-10:]:

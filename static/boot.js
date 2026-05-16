@@ -258,7 +258,8 @@ function _isDesktopWidth(){
 }
 
 function _isSidebarCollapsed(){
-  return document.querySelector('.layout')?.classList.contains('sidebar-collapsed')||false;
+  const layout=document.querySelector('.layout');
+  return !!(layout && layout.classList.contains('sidebar-collapsed'));
 }
 
 function _syncSidebarAria(){

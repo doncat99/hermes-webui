@@ -36,11 +36,13 @@ class TestAutoInstallAgentDeps:
         env = {'HERMES_WEBUI_AGENT_DIR': str(agent_dir), 'HERMES_WEBUI_AUTO_INSTALL': '1'}
         with patch.dict('os.environ', env, clear=False):
             with patch('api.startup._trusted_agent_dir', return_value=True):
-                with patch('subprocess.run') as mock_run:
-                    mock_run.return_value = MagicMock(returncode=0, stderr='')
-                    assert auto_install_agent_deps() is True
-                    args = mock_run.call_args[0][0]
-                    assert '-r' in args and str(req) in args
+                with patch('api.startup.PYTHON_EXE', '/agent/runtime/python', create=True):
+                    with patch('subprocess.run') as mock_run:
+                        mock_run.return_value = MagicMock(returncode=0, stderr='')
+                        assert auto_install_agent_deps() is True
+                        args = mock_run.call_args[0][0]
+                        assert args[0] == '/agent/runtime/python'
+                        assert '-r' in args and str(req) in args
 
     def test_falls_back_to_pyproject(self, tmp_path):
         agent_dir = tmp_path / 'hermes-agent'

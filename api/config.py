@@ -16,6 +16,7 @@ import logging
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -472,9 +473,28 @@ def verify_hermes_imports() -> tuple:
     required = ["run_agent"]
     missing = []
     errors = {}
+    probe_env = os.environ.copy()
+    if _AGENT_DIR is not None:
+        pythonpath_parts = [str(_AGENT_DIR)]
+        existing_pythonpath = probe_env.get("PYTHONPATH", "").strip()
+        if existing_pythonpath:
+            pythonpath_parts.append(existing_pythonpath)
+        probe_env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
     for mod in required:
         try:
-            __import__(mod)
+            result = subprocess.run(
+                [
+                    PYTHON_EXE,
+                    "-c",
+                    f"import {mod}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=probe_env,
+            )
+            if result.returncode != 0:
+                raise ModuleNotFoundError((result.stderr or result.stdout or "").strip() or f"failed to import {mod}")
         except Exception as e:
             missing.append(mod)
             # Capture the full error message so startup logs show WHY
@@ -2676,6 +2696,17 @@ def get_available_models() -> dict:
         if active_provider:
             detected_providers.add(active_provider)
 
+        _auth_store_providers = (
+            auth_store.get("providers", {}) if isinstance(auth_store, dict) else {}
+        )
+        if isinstance(_auth_store_providers, dict):
+            for _provider_id, _provider_payload in _auth_store_providers.items():
+                if not _provider_payload:
+                    continue
+                _canonical_provider = _resolve_provider_alias(str(_provider_id))
+                if _canonical_provider:
+                    detected_providers.add(_canonical_provider)
+
         try:
             _pool = auth_store.get("credential_pool", {}) if isinstance(auth_store, dict) else {}
             if isinstance(_pool, dict) and _pool:
@@ -2732,118 +2763,129 @@ def get_available_models() -> dict:
             logger.debug("Failed to inspect credential_pool from auth store")
 
         all_env: dict = {}
-
-        _hermes_auth_used = False
         try:
-            from hermes_cli.models import list_available_providers as _lap
-            from hermes_cli.auth import get_auth_status as _gas
+            from api.profiles import get_active_hermes_home as _gah2
 
-            for _p in _lap():
-                if not _p.get("authenticated"):
-                    continue
-                try:
-                    _src = _gas(_p["id"]).get("key_source", "")
-                    if _src == "gh auth token":
-                        continue
-                except Exception:
-                    logger.debug("Failed to get key source for provider %s", _p.get("id", "unknown"))
-                detected_providers.add(_p["id"])
-            _hermes_auth_used = True
-
-            # Belt-and-braces: list_available_providers() is the primary signal
-            # for OAuth providers, but its `authenticated` field can disagree
-            # with `get_auth_status(<id>).logged_in` on some hermes_cli versions
-            # (the two fields are computed via different code paths). When the
-            # disagreement happens for Nous Portal, the Settings → Providers
-            # card renders the live catalog (because api/providers.py iterates
-            # all OAuth providers regardless of authentication state) but the
-            # picker dropdown comes up empty — a confusing asymmetry reported
-            # in #1567. Add Nous explicitly when get_auth_status agrees so the
-            # picker stays in sync with the providers card.
+            hermes_env_path = _gah2() / ".env"
+        except ImportError:
+            hermes_env_path = HOME / ".hermes" / ".env"
+        env_keys = {}
+        if hermes_env_path.exists():
             try:
-                if _gas("nous").get("logged_in"):
-                    detected_providers.add("nous")
+                for line in hermes_env_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        env_keys[k.strip()] = v.strip().strip('"').strip("'")
             except Exception:
-                logger.debug("Failed to check Nous Portal auth status")
-        except Exception:
-            logger.debug("Failed to detect auth providers from hermes")
+                logger.debug("Failed to parse hermes env file")
+        all_env = {**env_keys}
+        for k in (
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "GOOGLE_API_KEY",
+            "GEMINI_API_KEY",
+            "GLM_API_KEY",
+            "KIMI_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "XIAOMI_API_KEY",
+            "OPENCODE_ZEN_API_KEY",
+            "OPENCODE_GO_API_KEY",
+            "MINIMAX_API_KEY",
+            "MINIMAX_CN_API_KEY",
+            "XAI_API_KEY",
+            "MISTRAL_API_KEY",
+        ):
+            val = os.getenv(k)
+            if val:
+                all_env[k] = val
+        if all_env.get("ANTHROPIC_API_KEY"):
+            detected_providers.add("anthropic")
+        if all_env.get("OPENAI_API_KEY"):
+            detected_providers.add("openai")
+            # openai-codex uses ChatGPT OAuth (not OPENAI_API_KEY) for its default endpoint.
+            # Detecting it here lets users who have both credentials configured find it in the
+            # picker without a manual config.yaml edit. Users without Codex OAuth will see
+            # picker entries but hit auth errors at inference time (#1189 known limitation).
+            detected_providers.add("openai-codex")
+        if all_env.get("OPENROUTER_API_KEY"):
+            detected_providers.add("openrouter")
+        if all_env.get("GOOGLE_API_KEY"):
+            detected_providers.add("google")
+        if all_env.get("GEMINI_API_KEY"):
+            detected_providers.add("gemini")
+        if all_env.get("GLM_API_KEY"):
+            detected_providers.add("zai")
+        if all_env.get("KIMI_API_KEY"):
+            detected_providers.add("kimi-coding")
+        if all_env.get("MINIMAX_API_KEY"):
+            detected_providers.add("minimax")
+        if all_env.get("MINIMAX_CN_API_KEY"):
+            detected_providers.add("minimax-cn")
+        if all_env.get("DEEPSEEK_API_KEY"):
+            detected_providers.add("deepseek")
+        if all_env.get("XIAOMI_API_KEY"):
+            detected_providers.add("xiaomi")
+        if all_env.get("XAI_API_KEY"):
+            detected_providers.add("x-ai")
+        if all_env.get("MISTRAL_API_KEY"):
+            detected_providers.add("mistralai")
+        if all_env.get("OPENCODE_ZEN_API_KEY"):
+            detected_providers.add("opencode-zen")
+        if all_env.get("OPENCODE_GO_API_KEY"):
+            detected_providers.add("opencode-go")
+        # LM Studio: detect via LM_API_KEY + LM_BASE_URL in ~/.hermes/.env
+        if all_env.get("LM_API_KEY") and all_env.get("LM_BASE_URL"):
+            detected_providers.add("lmstudio")
 
-        if not _hermes_auth_used:
+        _local_provider_signal = bool(
+            (isinstance(_auth_store_providers, dict) and _auth_store_providers)
+            or (isinstance(_pool, dict) and _pool)
+            or bool(all_env)
+        )
+
+        if not _local_provider_signal:
             try:
-                from api.profiles import get_active_hermes_home as _gah2
+                from hermes_cli.models import list_available_providers as _lap
+                from hermes_cli.auth import get_auth_status as _gas
 
-                hermes_env_path = _gah2() / ".env"
-            except ImportError:
-                hermes_env_path = HOME / ".hermes" / ".env"
-            env_keys = {}
-            if hermes_env_path.exists():
+                for _p in _lap():
+                    if not _p.get("authenticated"):
+                        continue
+                    _pid = str(_p.get("id") or "").strip()
+                    if not _pid:
+                        continue
+                    # Ambient GitHub CLI auth should not surface Copilot as a
+                    # durable picker provider; keep the old filter, but only
+                    # for this specific provider instead of re-checking every
+                    # authenticated provider.
+                    if _pid == "copilot":
+                        try:
+                            _src = _gas(_pid).get("key_source", "")
+                            if _src == "gh auth token":
+                                continue
+                        except Exception:
+                            logger.debug("Failed to get key source for provider %s", _pid)
+                    detected_providers.add(_pid)
+
+                # Belt-and-braces: list_available_providers() is the primary signal
+                # for OAuth providers, but its `authenticated` field can disagree
+                # with `get_auth_status(<id>).logged_in` on some hermes_cli versions
+                # (the two fields are computed via different code paths). When the
+                # disagreement happens for Nous Portal, the Settings → Providers
+                # card renders the live catalog (because api/providers.py iterates
+                # all OAuth providers regardless of authentication state) but the
+                # picker dropdown comes up empty — a confusing asymmetry reported
+                # in #1567. Add Nous explicitly when get_auth_status agrees so the
+                # picker stays in sync with the providers card.
                 try:
-                    for line in hermes_env_path.read_text(encoding="utf-8").splitlines():
-                        line = line.strip()
-                        if line and not line.startswith("#") and "=" in line:
-                            k, v = line.split("=", 1)
-                            env_keys[k.strip()] = v.strip().strip('"').strip("'")
+                    if _gas("nous").get("logged_in"):
+                        detected_providers.add("nous")
                 except Exception:
-                    logger.debug("Failed to parse hermes env file")
-            all_env = {**env_keys}
-            for k in (
-                "ANTHROPIC_API_KEY",
-                "OPENAI_API_KEY",
-                "OPENROUTER_API_KEY",
-                "GOOGLE_API_KEY",
-                "GEMINI_API_KEY",
-                "GLM_API_KEY",
-                "KIMI_API_KEY",
-                "DEEPSEEK_API_KEY",
-                "XIAOMI_API_KEY",
-                "OPENCODE_ZEN_API_KEY",
-                "OPENCODE_GO_API_KEY",
-                "MINIMAX_API_KEY",
-                "MINIMAX_CN_API_KEY",
-                "XAI_API_KEY",
-                "MISTRAL_API_KEY",
-            ):
-                val = os.getenv(k)
-                if val:
-                    all_env[k] = val
-            if all_env.get("ANTHROPIC_API_KEY"):
-                detected_providers.add("anthropic")
-            if all_env.get("OPENAI_API_KEY"):
-                detected_providers.add("openai")
-                # openai-codex uses ChatGPT OAuth (not OPENAI_API_KEY) for its default endpoint.
-                # Detecting it here lets users who have both credentials configured find it in the
-                # picker without a manual config.yaml edit. Users without Codex OAuth will see
-                # picker entries but hit auth errors at inference time (#1189 known limitation).
-                detected_providers.add("openai-codex")
-            if all_env.get("OPENROUTER_API_KEY"):
-                detected_providers.add("openrouter")
-            if all_env.get("GOOGLE_API_KEY"):
-                detected_providers.add("google")
-            if all_env.get("GEMINI_API_KEY"):
-                detected_providers.add("gemini")
-            if all_env.get("GLM_API_KEY"):
-                detected_providers.add("zai")
-            if all_env.get("KIMI_API_KEY"):
-                detected_providers.add("kimi-coding")
-            if all_env.get("MINIMAX_API_KEY"):
-                detected_providers.add("minimax")
-            if all_env.get("MINIMAX_CN_API_KEY"):
-                detected_providers.add("minimax-cn")
-            if all_env.get("DEEPSEEK_API_KEY"):
-                detected_providers.add("deepseek")
-            if all_env.get("XIAOMI_API_KEY"):
-                detected_providers.add("xiaomi")
-            if all_env.get("XAI_API_KEY"):
-                detected_providers.add("x-ai")
-            if all_env.get("MISTRAL_API_KEY"):
-                detected_providers.add("mistralai")
-            if all_env.get("OPENCODE_ZEN_API_KEY"):
-                detected_providers.add("opencode-zen")
-            if all_env.get("OPENCODE_GO_API_KEY"):
-                detected_providers.add("opencode-go")
-            # LM Studio: detect via LM_API_KEY + LM_BASE_URL in ~/.hermes/.env
-            if all_env.get("LM_API_KEY") and all_env.get("LM_BASE_URL"):
-                detected_providers.add("lmstudio")
+                    logger.debug("Failed to check Nous Portal auth status")
+            except Exception:
+                logger.debug("Failed to detect auth providers from hermes")
 
         # Also detect providers explicitly listed in config.yaml providers section.
         # A user may configure a provider key via config.yaml providers.<name>.api_key

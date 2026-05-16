@@ -1,4 +1,5 @@
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -75,6 +76,15 @@ def wait_for_pid_file(pid_file: Path, timeout: float = 3.0) -> int:
     raise AssertionError(f"PID file was not written: {pid_file}")
 
 
+def wait_for_file(path: Path, timeout: float = 3.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"file was not written: {path}")
+
+
 def assert_process_exits(pid: int, timeout: float = 3.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -110,6 +120,7 @@ def test_start_writes_pid_under_hermes_home_runs_foreground_no_browser_and_logs(
     try:
         assert pid > 1
         assert log_file.exists()
+        wait_for_file(fake_log)
         fake_output = fake_log.read_text(encoding="utf-8")
         assert "bootstrap.py --no-browser --foreground" in fake_output
         assert "host=0.0.0.0 port=18991" in fake_output
@@ -154,6 +165,7 @@ def test_start_loads_dotenv_but_inline_overrides_win(tmp_path):
     assert result.returncode == 0, result.stderr + result.stdout
     pid = wait_for_pid_file(tmp_path / ".hermes" / "webui.pid")
     try:
+        wait_for_file(fake_log)
         fake_output = fake_log.read_text(encoding="utf-8")
         assert "fake-python args:" in fake_output
         assert "host=0.0.0.0 port=18888" in fake_output
@@ -193,3 +205,100 @@ def test_logs_supports_non_following_line_count(tmp_path):
 
     assert result.returncode == 0
     assert result.stdout == "two\nthree\n"
+
+
+def test_status_recognizes_relative_server_py_process(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    shutil.copy2(CTL, repo_root / "ctl.sh")
+    (repo_root / "server.py").write_text(
+        "import time\nwhile True:\n    time.sleep(0.1)\n",
+        encoding="utf-8",
+    )
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    pid_file = hermes_home / "webui.pid"
+    state_file = hermes_home / "webui.ctl.env"
+    log_file = hermes_home / "webui.log"
+
+    proc = subprocess.Popen([sys.executable, "server.py"], cwd=repo_root)
+    start_signature = (
+        subprocess.check_output(["ps", "-p", str(proc.pid), "-o", "lstart="], text=True)
+        .strip()
+    )
+    pid_file.write_text(str(proc.pid), encoding="utf-8")
+    state_file.write_text(
+        "\n".join(
+            [
+                f"PID={proc.pid}",
+                f"REPO_ROOT={repo_root}",
+                f"PID_START_SIGNATURE={shlex.quote(start_signature)}",
+                "HOST=127.0.0.1",
+                "PORT=8787",
+                f"LOG_FILE={log_file}",
+                f"STATE_DIR={hermes_home / 'webui'}",
+                "STARTED_AT=2026-05-16T00:00:00Z",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    try:
+        status = run_ctl(tmp_path, "status", repo_root=repo_root)
+        assert status.returncode == 0
+        assert "running" in status.stdout
+        assert f"PID:     {proc.pid}" in status.stdout
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def test_status_preserves_pid_file_for_alive_unverified_process(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    shutil.copy2(CTL, repo_root / "ctl.sh")
+    (repo_root / "server.py").write_text(
+        "import time\nwhile True:\n    time.sleep(0.1)\n",
+        encoding="utf-8",
+    )
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    pid_file = hermes_home / "webui.pid"
+    state_file = hermes_home / "webui.ctl.env"
+    log_file = hermes_home / "webui.log"
+
+    proc = subprocess.Popen([sys.executable, "server.py"], cwd=repo_root)
+    pid_file.write_text(str(proc.pid), encoding="utf-8")
+    state_file.write_text(
+        "\n".join(
+            [
+                f"PID={proc.pid}",
+                f"REPO_ROOT={repo_root}",
+                "PID_START_SIGNATURE=mismatch",
+                "HOST=127.0.0.1",
+                "PORT=8787",
+                f"LOG_FILE={log_file}",
+                f"STATE_DIR={hermes_home / 'webui'}",
+                "STARTED_AT=2026-05-16T00:00:00Z",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    try:
+        status = run_ctl(tmp_path, "status", repo_root=repo_root)
+        assert status.returncode == 0
+        assert "starting" in status.stdout
+        assert pid_file.exists()
+        assert state_file.exists()
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()

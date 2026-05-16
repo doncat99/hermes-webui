@@ -10,6 +10,7 @@ import sys
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 # ── Test-mode network isolation ─────────────────────────────────────────────
 # When `HERMES_WEBUI_TEST_NETWORK_BLOCK=1` is set in the environment, refuse
@@ -116,7 +117,7 @@ from api.config import HOST, PORT, STATE_DIR, SESSION_DIR, DEFAULT_WORKSPACE
 from api.helpers import j, get_profile_cookie
 from api.profiles import set_request_profile, clear_request_profile
 from api.routes import handle_delete, handle_get, handle_patch, handle_post
-from api.startup import auto_install_agent_deps, fix_credential_permissions
+from api.startup import auto_install_agent_deps, ensure_server_runtime_python, fix_credential_permissions
 from api.updates import WEBUI_VERSION
 
 
@@ -312,7 +313,15 @@ def _raise_fd_soft_limit(target: int = 4096) -> dict:
 
 
 def main() -> None:
-    from api.config import print_startup_config, verify_hermes_imports, _HERMES_FOUND
+    from api.config import print_startup_config, verify_hermes_imports, _HERMES_FOUND, PYTHON_EXE, _AGENT_DIR
+
+    ensure_server_runtime_python(
+        current_python=sys.executable,
+        target_python=PYTHON_EXE,
+        agent_dir=_AGENT_DIR,
+        server_script=Path(__file__).resolve(),
+        argv=sys.argv,
+    )
 
     print_startup_config()
 

@@ -57,6 +57,31 @@ TEST_STATE_DIR = pathlib.Path(os.getenv(
 ))
 TEST_WORKSPACE = TEST_STATE_DIR / 'test-workspace'
 
+
+def _kill_listeners_on_port(port: int) -> None:
+    """Best-effort cleanup for stale test servers across Linux/macOS."""
+    try:
+        result = subprocess.run(
+            ['lsof', '-tiTCP:%s' % port, '-sTCP:LISTEN'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        result = None
+    if result and result.returncode == 0:
+        pids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if pids:
+            try:
+                subprocess.run(['kill', *pids], capture_output=True, timeout=5)
+            except Exception:
+                pass
+            return
+    try:
+        subprocess.run(['fuser', '-k', f'{port}/tcp'], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
 # Publish at module level so api.config, _pytest_port.py, and any test module
 # importing stateful API code during collection see the isolated test paths.
 #
@@ -421,12 +446,7 @@ def test_server():
     # Kill any leftover process on the test port before starting.
     # Stale servers from QA harness runs or prior test sessions cause
     # conftest to think the server is already up, producing false failures.
-    try:
-        import subprocess as _sp
-        _sp.run(['fuser', '-k', f'{TEST_PORT}/tcp'],
-                capture_output=True, timeout=5)
-    except Exception:
-        pass
+    _kill_listeners_on_port(TEST_PORT)
     import time as _time
     _time.sleep(0.5)  # brief pause to let the port release
 

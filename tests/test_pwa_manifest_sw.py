@@ -165,9 +165,9 @@ class TestPWARoutes:
         idx = src.find('"/sw.js"')
         assert idx != -1, "routes.py must handle /sw.js"
         block = src[idx:idx + 1200]
-        assert "quote(WEBUI_VERSION, safe=\"\")" in block, (
-            "sw.js route must URL-encode the injected cache version so unusual git tags "
-            "cannot break the JavaScript string literal"
+        assert "quote(_webui_asset_version_token(), safe=\"\")" in block, (
+            "sw.js route must URL-encode the injected asset version token so unusual git tags "
+            "or file-derived suffixes cannot break the JavaScript string literal"
         )
 
     def test_sw_route_sets_service_worker_allowed(self):
@@ -284,9 +284,28 @@ class TestIndexHtmlIntegration:
             idx = src.find('parsed.path.startswith("/session/")')
         assert idx != -1, "routes.py must handle /, /index.html, and /session/<id>"
         block = src[idx:idx + 800]
-        assert "quote(WEBUI_VERSION, safe=\"\")" in block, (
+        assert "quote(_webui_asset_version_token(), safe=\"\")" in block, (
             "index route must URL-encode the cache-busting version token before "
             "injecting it into script src attributes and service worker registration"
+        )
+
+    def test_routes_define_runtime_asset_version_token_for_local_hotfixes(self):
+        src = ROUTES.read_text(encoding="utf-8")
+        assert "def _webui_asset_version_token()" in src, (
+            "routes.py should define a runtime asset-version helper instead of "
+            "relying on the import-time WEBUI_VERSION alone."
+        )
+        helper_idx = src.index("def _webui_asset_version_token()")
+        helper_block = src[helper_idx:helper_idx + 2200]
+        assert "WEBUI_VERSION" in helper_block, (
+            "Asset version token should retain the human version prefix."
+        )
+        assert "st_mtime_ns" in helper_block, (
+            "Asset version token should derive a suffix from live file mtimes so "
+            "local JS/CSS edits change the requested asset URL immediately."
+        )
+        assert "style.css" in helper_block and "panels.js" in helper_block and "sw.js" in helper_block, (
+            "Asset version token should watch the core shell assets that must invalidate caches."
         )
 
     def test_index_sw_registration_uses_relative_path(self):
