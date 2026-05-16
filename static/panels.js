@@ -287,10 +287,10 @@ async function switchPanel(name, opts = {}) {
   }
   syncAppTitlebar();
   // Lazy-load panel data
-  if (nextPanel === 'tasks') await loadCrons();
-  if (nextPanel === 'kanban') await loadKanban();
-  if (nextPanel === 'skills') await loadSkills();
-  if (nextPanel === 'memory') await loadMemory();
+  if (nextPanel === 'tasks') { await mountTasksPanel(); await loadCrons(); }
+  if (nextPanel === 'kanban') { await mountKanbanPanel(); await loadKanban(); }
+  if (nextPanel === 'skills') { await mountSkillsPanel(); await loadSkills(); }
+  if (nextPanel === 'memory') { await mountMemoryPanel(); await loadMemory(); }
   if (nextPanel === 'workspaces') await loadWorkspacesPanel();
   if (nextPanel === 'profiles') await loadProfilesPanel();
   if (nextPanel === 'todos') loadTodos();
@@ -461,50 +461,79 @@ function _cronDiagnostics(job) {
   return JSON.stringify(fields, null, 2);
 }
 
+async function mountTasksPanel() {
+  const state = _panelRefreshState('tasks');
+  if (state.mounted) return;
+  state.mounted = true;
+  _panelRememberSelection(state, _currentCronDetail ? _currentCronDetail.id : '');
+}
+
+async function loadTasksData(mode) {
+  await loadCronProfiles();
+  const data = await api('/api/crons');
+  return {
+    jobs: data.jobs || [],
+    mode,
+  };
+}
+
+function patchTasksView(prev, next, mode) {
+  const box = $('cronList');
+  if (!box) return;
+  _cronList = next.jobs || [];
+  if (!_cronList.length) {
+    box.innerHTML = `<div style="padding:16px;color:var(--muted);font-size:12px">${esc(t('cron_no_jobs'))}</div>`;
+    if (_cronMode !== 'create' && _cronMode !== 'edit') _clearCronDetail();
+    return;
+  }
+  box.innerHTML = '';
+  for (const job of _cronList) {
+    const item = document.createElement('div');
+    item.className = 'cron-item';
+    item.id = 'cron-' + job.id;
+    const status = _cronStatusMeta(job);
+    const isNewRun = _cronNewJobIds.has(String(job.id));
+    const profileLabel = _cronProfileLabel(job.profile);
+    const profileTitle = _cronProfileTitle(job.profile);
+    item.innerHTML = `
+      <div class="cron-header">
+        ${isNewRun ? '<span class="cron-new-dot" title="New run"></span>' : ''}
+        <span class="cron-name" title="${esc(job.name)}">${esc(job.name)}</span>
+        <span class="cron-profile-badge" title="${esc(profileTitle)}">${esc(profileLabel)}</span>
+        <span class="cron-status ${status.listClass}">${esc(status.label)}</span>
+      </div>`;
+    item.onclick = () => openCronDetail(job.id, item);
+    if (_currentCronDetail && _currentCronDetail.id === job.id) item.classList.add('active');
+    box.appendChild(item);
+  }
+  if (_currentCronDetail && _cronMode !== 'create' && _cronMode !== 'edit') {
+    const refreshed = _cronList.find(j => j.id === _currentCronDetail.id);
+    if (refreshed) _renderCronDetail(refreshed);
+    else _clearCronDetail();
+  }
+}
+
 async function loadCrons(animate) {
   const box = $('cronList');
   const refreshBtn = $('cronRefreshBtn');
+  await mountTasksPanel();
   if (animate && refreshBtn) {
     refreshBtn.style.opacity = '0.5';
     refreshBtn.disabled = true;
   }
+  const state = _panelRefreshState('tasks');
+  const mode = animate ? 'foreground' : (state.currentModel ? 'background' : 'mount');
   try {
-    await loadCronProfiles();
-    const data = await api('/api/crons');
-    _cronList = data.jobs || [];
-    if (!_cronList.length) {
-      box.innerHTML = `<div style="padding:16px;color:var(--muted);font-size:12px">${esc(t('cron_no_jobs'))}</div>`;
-      if (_cronMode !== 'create' && _cronMode !== 'edit') _clearCronDetail();
-      return;
-    }
-    box.innerHTML = '';
-    for (const job of _cronList) {
-      const item = document.createElement('div');
-      item.className = 'cron-item';
-      item.id = 'cron-' + job.id;
-      const status = _cronStatusMeta(job);
-      const isNewRun = _cronNewJobIds.has(String(job.id));
-      const profileLabel = _cronProfileLabel(job.profile);
-      const profileTitle = _cronProfileTitle(job.profile);
-      item.innerHTML = `
-        <div class="cron-header">
-          ${isNewRun ? '<span class="cron-new-dot" title="New run"></span>' : ''}
-          <span class="cron-name" title="${esc(job.name)}">${esc(job.name)}</span>
-          <span class="cron-profile-badge" title="${esc(profileTitle)}">${esc(profileLabel)}</span>
-          <span class="cron-status ${status.listClass}">${esc(status.label)}</span>
-        </div>`;
-      item.onclick = () => openCronDetail(job.id, item);
-      if (_currentCronDetail && _currentCronDetail.id === job.id) item.classList.add('active');
-      box.appendChild(item);
-    }
-    // Re-render current detail with fresh data if we have one and we're not in a form
-    if (_currentCronDetail && _cronMode !== 'create' && _cronMode !== 'edit') {
-      const refreshed = _cronList.find(j => j.id === _currentCronDetail.id);
-      if (refreshed) _renderCronDetail(refreshed);
-      else _clearCronDetail();
-    }
-  } catch(e) { box.innerHTML = `<div style="padding:12px;color:var(--accent);font-size:12px">${esc(t('error_prefix'))}${esc(e.message)}</div>`; }
-  finally {
+    await _runPanelRefresh('tasks', async (panelState) => {
+      panelState.lastArgs = { animate: !!animate };
+      const next = await loadTasksData(mode);
+      patchTasksView(panelState.currentModel, next, mode);
+      panelState.currentModel = next;
+      _panelRememberSelection(panelState, _currentCronDetail ? _currentCronDetail.id : '');
+    });
+  } catch (e) {
+    if (box) box.innerHTML = `<div style="padding:12px;color:var(--accent);font-size:12px">${esc(t('error_prefix'))}${esc(e.message)}</div>`;
+  } finally {
     if (animate && refreshBtn) {
       refreshBtn.style.opacity = '';
       refreshBtn.disabled = false;
@@ -677,6 +706,7 @@ async function _loadRunContent(jobId, filename, runId){
 function openCronDetail(id, el){
   const job = _cronList ? _cronList.find(j => j.id === id) : null;
   if (!job) return;
+  _panelRememberSelection(_panelRefreshState('tasks'), id);
   document.querySelectorAll('.cron-item').forEach(e => e.classList.remove('active'));
   const target = el || $('cron-' + id);
   if (target) target.classList.add('active');
@@ -1138,6 +1168,7 @@ function _kanbanApplyConfigDefaults(config){
   _kanbanConfigApplied = true;
 }
 let _kanbanConfigApplied = false;
+let _kanbanConfig = null;
 
 function _kanbanSetSelectOptions(el, values, allLabelKey){
   if (!el) return;
@@ -1366,53 +1397,87 @@ function _kanbanUnavailableHtml(err){
   return `<div class="main-view-empty"><div class="main-view-empty-title">${msg}</div></div>`;
 }
 
-async function loadKanban(animate){
+async function mountKanbanPanel() {
+  const state = _panelRefreshState('kanban');
+  if (state.mounted) return;
+  state.mounted = true;
+  _panelRememberSelection(state, _kanbanCurrentTaskId || '');
+}
+
+async function loadKanbanData(mode, options){
+  const board = $('kanbanBoard');
+  const opts = options || {};
+  const includeBoardList = opts.includeBoardList !== false;
+  const includeAssignees = opts.includeAssignees !== false;
+  const includeConfig = opts.includeConfig !== false;
+  const includeLiveSetup = opts.includeLiveSetup !== false;
+  if (includeBoardList) await loadKanbanBoards();
+  const config = (includeConfig || !_kanbanConfig)
+    ? await api('/api/kanban/config' + _kanbanBoardQuery())
+    : _kanbanConfig;
+  if (config) _kanbanConfig = config;
+  let assignees = null;
+  if (includeAssignees) {
+    try { assignees = await api('/api/kanban/assignees' + _kanbanBoardQuery()); } catch(e) { assignees = null; }
+  }
+  _kanbanApplyConfigDefaults(config);
+  const filters = _kanbanCurrentFilters();
+  const params = new URLSearchParams();
+  if (filters.assignee) params.set('assignee', filters.assignee);
+  if (filters.tenant) params.set('tenant', filters.tenant);
+  if (filters.includeArchived) params.set('include_archived', '1');
+  if (filters.onlyMine) params.set('only_mine', '1');
+  if (_kanbanCurrentBoard) params.set('board', _kanbanCurrentBoard);
+  const path = '/api/kanban/board' + (params.toString() ? '?' + params.toString() : '');
+  const data = await api(path);
+  if (data && data.changed === false && _kanbanBoard) return { unchanged: true };
+  return {
+    board: data || {columns: []},
+    config,
+    assignees,
+    includeLiveSetup,
+    mode,
+  };
+}
+
+function patchKanbanView(prev, next, mode){
+  if (!next || next.unchanged) {
+    _kanbanRenderBoard();
+    return;
+  }
+  _kanbanBoard = next.board || { columns: [] };
+  if ((!_kanbanBoard.columns || !_kanbanBoard.columns.length) && next.config && next.config.columns) {
+    _kanbanBoard.columns = next.config.columns.map(name => ({ name, tasks: [] }));
+  }
+  _kanbanLatestEventId = Number(_kanbanBoard.latest_event_id || 0);
+  try {
+    const ro = document.querySelector('.kanban-readonly');
+    if (ro) ro.style.display = _kanbanBoard.read_only ? '' : 'none';
+  } catch(_) {}
+  _kanbanSetSelectOptions($('kanbanAssigneeFilter'), _kanbanBoard.assignees || (next.assignees && next.assignees.assignees) || (next.config && next.config.assignees), 'kanban_all_assignees');
+  _kanbanSetSelectOptions($('kanbanTenantFilter'), _kanbanBoard.tenants, 'kanban_all_tenants');
+  _kanbanRenderBoard();
+}
+
+async function loadKanban(animate, options){
   const board = $('kanbanBoard');
   const list = $('kanbanList');
+  await mountKanbanPanel();
+  const state = _panelRefreshState('kanban');
+  const mode = animate ? 'foreground' : (state.currentModel ? 'background' : 'mount');
   try {
-    if (animate && board) board.innerHTML = `<div style="padding:16px;color:var(--muted);font-size:13px">${esc(t('loading'))}</div>`;
-    // Resolve the active board before board-scoped requests. If another CLI or
-    // tab archived the previous board, /boards can fall back to default instead
-    // of leaving config/board pinned to a ghost slug.
-    await loadKanbanBoards();
-    const config = await api('/api/kanban/config' + _kanbanBoardQuery());
-    let assignees = null;
-    try { assignees = await api('/api/kanban/assignees' + _kanbanBoardQuery()); } catch(e) { assignees = null; }
-    _kanbanApplyConfigDefaults(config);
-    const filters = _kanbanCurrentFilters();
-    const params = new URLSearchParams();
-    if (filters.assignee) params.set('assignee', filters.assignee);
-    if (filters.tenant) params.set('tenant', filters.tenant);
-    if (filters.includeArchived) params.set('include_archived', '1');
-    if (filters.onlyMine) params.set('only_mine', '1');
-    if (_kanbanCurrentBoard) params.set('board', _kanbanCurrentBoard);
-    const path = '/api/kanban/board' + (params.toString() ? '?' + params.toString() : '');
-    const data = await api(path);
-    if (data && data.changed === false && _kanbanBoard) { _kanbanRenderBoard(); return; }
-    _kanbanBoard = data || {columns: []};
-    if ((!_kanbanBoard.columns || !_kanbanBoard.columns.length) && config && config.columns) {
-      _kanbanBoard.columns = config.columns.map(name => ({name, tasks: []}));
+    if (mode === 'mount' && board) {
+      board.innerHTML = `<div style="padding:16px;color:var(--muted);font-size:13px">${esc(t('loading'))}</div>`;
     }
-    _kanbanLatestEventId = Number(_kanbanBoard.latest_event_id || 0);
-    // Toggle the "Read-only view" banner based on the bridge's read_only flag.
-    // Bridge sets read_only=true only when the kanban_db connection cannot accept
-    // writes (e.g. dispatcher contention or library missing). Hide otherwise.
-    try {
-      const ro = document.querySelector('.kanban-readonly');
-      if (ro) ro.style.display = _kanbanBoard.read_only ? '' : 'none';
-    } catch(_) {}
-    _kanbanSetSelectOptions($('kanbanAssigneeFilter'), _kanbanBoard.assignees || (assignees && assignees.assignees) || (config && config.assignees), 'kanban_all_assignees');
-    _kanbanSetSelectOptions($('kanbanTenantFilter'), _kanbanBoard.tenants, 'kanban_all_tenants');
-    await loadKanbanStats();
-    // Note: PR #1828 (v0.51.20) moved the boards refresh to the start of
-    // loadKanban() so the active board is resolved BEFORE board-scoped
-    // requests fire. The previous tail-of-function refresh has been removed
-    // to avoid doubling /api/kanban/boards traffic during SSE-driven
-    // refreshes (debounced at 250ms via _scheduleKanbanRefresh). The
-    // 30-second poll started by _kanbanStartPolling() picks up any board
-    // state changes that arrive after this render.
-    _kanbanStartPolling();
-    _kanbanRenderBoard();
+    await _runPanelRefresh('kanban', async (panelState) => {
+      panelState.lastArgs = { animate: !!animate, options: options || {} };
+      const next = await loadKanbanData(mode, options);
+      patchKanbanView(panelState.currentModel, next, mode);
+      panelState.currentModel = next;
+      await loadKanbanStats();
+      if (next && next.includeLiveSetup) _kanbanStartPolling();
+      _panelRememberSelection(panelState, _kanbanCurrentTaskId || '');
+    });
   } catch(e) {
     const html = _kanbanUnavailableHtml(e);
     if (board) board.innerHTML = html;
@@ -1443,7 +1508,7 @@ async function refreshKanbanEvents(){
     const events = await api(eventsEndpoint + _kanbanBoardQuery({since: _kanbanLatestEventId}));
     if (events && Array.isArray(events.events) && events.events.length) {
       _kanbanLatestEventId = Number(events.latest_event_id || events.cursor || _kanbanLatestEventId);
-      await loadKanban(true);
+      await loadKanban(false, {includeBoardList: false, includeAssignees: false, includeConfig: false, includeLiveSetup: false});
       if (_kanbanCurrentTaskId && events.events.some(ev => ev.task_id === _kanbanCurrentTaskId)) await loadKanbanTask(_kanbanCurrentTaskId);
     }
   } catch(e) { /* polling should not spam toasts */ }
@@ -1457,6 +1522,7 @@ function _kanbanStartPolling(){
     _kanbanPollTimer = setInterval(refreshKanbanEvents, 30000);
     return;
   }
+  if (_kanbanEventSource) return;
   _kanbanStartEventStream();
 }
 
@@ -1510,25 +1576,43 @@ function _kanbanStartEventStream(){
 }
 
 let _kanbanRefreshScheduled = false;
+let _kanbanRefreshInFlight = false;
+let _kanbanRefreshRerunRequested = false;
 let _kanbanRefreshPendingTaskIds = new Set();
 function _scheduleKanbanRefresh(events){
   for (const ev of events) {
     if (ev && ev.task_id) _kanbanRefreshPendingTaskIds.add(ev.task_id);
+  }
+  if (_kanbanRefreshInFlight) {
+    _kanbanRefreshRerunRequested = true;
+    return;
   }
   if (_kanbanRefreshScheduled) return;
   _kanbanRefreshScheduled = true;
   // 250ms debounce — keeps a burst of N events from triggering N reloads.
   setTimeout(async () => {
     _kanbanRefreshScheduled = false;
+    if (_kanbanRefreshInFlight) {
+      _kanbanRefreshRerunRequested = true;
+      return;
+    }
     const taskIds = Array.from(_kanbanRefreshPendingTaskIds);
     _kanbanRefreshPendingTaskIds.clear();
     if (_currentPanel !== 'kanban') return;
+    _kanbanRefreshInFlight = true;
     try {
-      await loadKanban(true);
+      await loadKanban(false, {includeBoardList: false, includeAssignees: false, includeConfig: false, includeLiveSetup: false});
       if (_kanbanCurrentTaskId && taskIds.includes(_kanbanCurrentTaskId)) {
         await loadKanbanTask(_kanbanCurrentTaskId);
       }
     } catch(_) { /* swallow — SSE refresh shouldn't toast */ }
+    finally {
+      _kanbanRefreshInFlight = false;
+      if (_kanbanRefreshRerunRequested && _currentPanel === 'kanban') {
+        _kanbanRefreshRerunRequested = false;
+        _scheduleKanbanRefresh([]);
+      }
+    }
   }, 250);
 }
 
@@ -1676,6 +1760,7 @@ async function unblockKanbanTask(taskId){
 
 function closeKanbanTaskDetail(){
   _kanbanCurrentTaskId = null;
+  _panelRememberSelection(_panelRefreshState('kanban'), '');
   const preview = $('kanbanTaskPreview');
   if (preview) {
     preview.style.display = 'none';
@@ -2308,6 +2393,7 @@ async function loadKanbanTask(taskId){
     const logEndpoint = '/api/kanban/tasks/' + encodeURIComponent(taskId) + '/log' + _kanbanBoardQuery();
     try { data.log = await api(logEndpoint + '?tail=65536'); } catch(e) { data.log = {}; }
     _kanbanCurrentTaskId = taskId;
+    _panelRememberSelection(_panelRefreshState('kanban'), taskId);
     const task = data.task || {};
     const title = _kanbanTaskTitle(task);
     const board = $('kanbanBoard');
@@ -2527,6 +2613,7 @@ async function switchKanbanBoard(slug){
   _kanbanCurrentBoard = newBoard;
   _kanbanSetSavedBoard(slug);
   _kanbanLatestEventId = 0;  // reset cursor — new board has its own event sequence
+  _kanbanConfig = null;
   _kanbanBoardMenuOpen = false;
   const menu = document.getElementById('kanbanBoardSwitcherMenu');
   if (menu) menu.hidden = true;
@@ -2540,8 +2627,6 @@ async function switchKanbanBoard(slug){
   // Re-open the SSE stream on the new board.
   _kanbanStopPolling();
   await loadKanban(true);
-  await loadKanbanBoards();
-  _kanbanStartPolling();
 }
 
 // ── Create / rename / archive board modals ──────────────────────────────────
@@ -2659,10 +2744,9 @@ async function submitKanbanBoardModal(){
       _kanbanCurrentBoard = (newSlug === 'default') ? null : newSlug;
       _kanbanSetSavedBoard(newSlug);
       _kanbanLatestEventId = 0;
+      _kanbanConfig = null;
       _kanbanStopPolling();
       await loadKanban(true);
-      await loadKanbanBoards();
-      _kanbanStartPolling();
     } catch(e) {
       errEl.textContent = (e && (e.message || e.error)) || String(e);
     } finally {
@@ -2712,9 +2796,8 @@ async function archiveKanbanBoard(){
     _kanbanCurrentBoard = null;
     _kanbanSetSavedBoard('default');
     _kanbanLatestEventId = 0;
+    _kanbanConfig = null;
     await loadKanban(true);
-    await loadKanbanBoards();
-    _kanbanStartPolling();
     showToast(t('kanban_board_archived') || 'Board archived');
   } catch(e) {
     // Restart the stream on failure so the UI doesn't go stale.
@@ -3425,24 +3508,55 @@ async function clearConversation() {
 }
 
 // ── Skills panel ──
+async function mountSkillsPanel() {
+  const state = _panelRefreshState('skills');
+  if (state.mounted) return;
+  state.mounted = true;
+  _panelRememberSelection(state, '');
+}
+
+async function loadSkillsData(mode) {
+  const endpoint = _ontosynthSkillsScopedModeEnabled() ? '/api/ontosynth/skills/overview' : '/api/skills';
+  return await api(endpoint);
+}
+
+function patchSkillsView(prev, next, mode) {
+  if (_ontosynthSkillsScopedModeEnabled()) {
+    _skillsData = next || {};
+    renderOntoSynthSkillsOverview(next);
+    return;
+  }
+  _skillsData = next.skills || [];
+  const liveCats = new Set(_skillsData.map(s => s.category || '(general)'));
+  for (const c of _collapsedCats) {
+    if (!liveCats.has(c)) _collapsedCats.delete(c);
+  }
+  renderSkills(_skillsData);
+}
+
 async function loadSkills() {
-  if (_skillsData) { renderSkills(_skillsData); return; }
   const box = $('skillsList');
+  await mountSkillsPanel();
+  const state = _panelRefreshState('skills');
+  const mode = state.currentModel ? 'background' : 'mount';
+  if (mode === 'mount' && _skillsData) {
+    patchSkillsView(state.currentModel, _ontosynthSkillsScopedModeEnabled() ? _skillsData : { skills: _skillsData }, 'mount');
+    state.currentModel = _ontosynthSkillsScopedModeEnabled() ? _skillsData : { skills: _skillsData };
+    return;
+  }
   try {
-    const endpoint = _ontosynthSkillsScopedModeEnabled() ? '/api/ontosynth/skills/overview' : '/api/skills';
-    const data = await api(endpoint);
-    if (_ontosynthSkillsScopedModeEnabled()) {
-      _skillsData = data || {};
-      renderOntoSynthSkillsOverview(data);
-      return;
-    }
-    _skillsData = data.skills || [];
-    // Prune collapsed state to only keep categories present in fresh data,
-    // avoiding stale keys when categories are renamed or removed server-side.
-    const liveCats = new Set(_skillsData.map(s => s.category || '(general)'));
-    for (const c of _collapsedCats) { if (!liveCats.has(c)) _collapsedCats.delete(c); }
-    renderSkills(_skillsData);
-  } catch(e) { box.innerHTML = `<div style="padding:12px;color:var(--accent);font-size:12px">Error: ${esc(e.message)}</div>`; }
+    await _runPanelRefresh('skills', async (panelState) => {
+      const next = await loadSkillsData(mode);
+      patchSkillsView(panelState.currentModel, next, mode);
+      panelState.currentModel = next;
+      if (_skillMode === 'read' && panelState.selectedId) {
+        if (_ontosynthSkillsScopedModeEnabled()) openOntoSynthSkillDetail(panelState.selectedId, null);
+        else await openSkill(panelState.selectedId, null);
+      }
+    });
+  } catch (e) {
+    if (box) box.innerHTML = `<div style="padding:12px;color:var(--accent);font-size:12px">Error: ${esc(e.message)}</div>`;
+  }
 }
 
 let _collapsedCats = new Set(); // persisted collapsed state across re-renders
@@ -3796,6 +3910,7 @@ function _renderOntoSynthSkillDetail(detail) {
 }
 
 function openOntoSynthSkillDetail(detailKey, el) {
+  _panelRememberSelection(_panelRefreshState('skills'), detailKey);
   document.querySelectorAll('.skill-item').forEach(e => e.classList.remove('active'));
   if (el) el.classList.add('active');
   const detail = _skillsData?.detail_index?.[detailKey];
@@ -3807,6 +3922,7 @@ function openOntoSynthSkillDetail(detailKey, el) {
 }
 
 function openOntoSynthManagedSkillDetail(detailKey, el) {
+  _panelRememberSelection(_panelRefreshState('skills'), detailKey);
   document.querySelectorAll('.skill-item').forEach(e => e.classList.remove('active'));
   if (el) el.classList.add('active');
   const detail = _skillsData?.detail_index?.[detailKey];
@@ -3818,6 +3934,7 @@ function openOntoSynthManagedSkillDetail(detailKey, el) {
 }
 
 function openOntoSynthRuntimeSkillDetail(detailKey, el) {
+  _panelRememberSelection(_panelRefreshState('skills'), detailKey);
   document.querySelectorAll('.skill-item').forEach(e => e.classList.remove('active'));
   if (el) el.classList.add('active');
   const detail = _skillsData?.detail_index?.[detailKey];
@@ -3957,6 +4074,7 @@ function _setSkillHeaderButtons(mode) {
 }
 
 async function openSkill(name, el) {
+  _panelRememberSelection(_panelRefreshState('skills'), name);
   // Highlight active skill in the sidebar list
   document.querySelectorAll('.skill-item').forEach(e => e.classList.remove('active'));
   if (el) el.classList.add('active');
@@ -4234,6 +4352,7 @@ function _renderMemoryEdit(section) {
 
 function openMemorySection(section, el) {
   _currentMemorySection = section;
+  _panelRememberSelection(_panelRefreshState('memory'), section);
   document.querySelectorAll('#memoryPanel .side-menu-item').forEach(e => e.classList.remove('active'));
   if (el) el.classList.add('active');
   _renderMemoryDetail(section);
@@ -5497,27 +5616,51 @@ async function deleteProfile(name) {
 }
 
 // ── Memory panel ──
+async function mountMemoryPanel() {
+  const state = _panelRefreshState('memory');
+  if (state.mounted) return;
+  state.mounted = true;
+  _panelRememberSelection(state, _currentMemorySection || '');
+}
+
+async function loadMemoryData(mode) {
+  return await api('/api/memory');
+}
+
+function patchMemoryView(prev, next, mode) {
+  const panel = $('memoryPanel');
+  _memoryData = next;
+  if (!_currentMemorySection) _currentMemorySection = MEMORY_SECTIONS[0].key;
+  if (panel) {
+    panel.innerHTML = '';
+    for (const s of MEMORY_SECTIONS) {
+      const el = document.createElement('button');
+      el.type = 'button';
+      el.className = 'side-menu-item';
+      if (_currentMemorySection === s.key) el.classList.add('active');
+      el.innerHTML = `${li(s.iconKey,16)}<span>${esc(t(s.labelKey))}</span>`;
+      el.onclick = () => openMemorySection(s.key, el);
+      panel.appendChild(el);
+    }
+  }
+  if (_currentMemorySection && _memoryMode !== 'edit') {
+    _renderMemoryDetail(_currentMemorySection);
+  }
+}
+
 async function loadMemory(force) {
   const panel = $('memoryPanel');
+  await mountMemoryPanel();
+  const state = _panelRefreshState('memory');
+  const mode = force ? 'foreground' : (state.currentModel ? 'background' : 'mount');
   try {
-    const data = await api('/api/memory');
-    _memoryData = data;
-    if (panel) {
-      panel.innerHTML = '';
-      for (const s of MEMORY_SECTIONS) {
-        const el = document.createElement('button');
-        el.type = 'button';
-        el.className = 'side-menu-item';
-        if (_currentMemorySection === s.key) el.classList.add('active');
-        el.innerHTML = `${li(s.iconKey,16)}<span>${esc(t(s.labelKey))}</span>`;
-        el.onclick = () => openMemorySection(s.key, el);
-        panel.appendChild(el);
-      }
-    }
-    if (_currentMemorySection && _memoryMode !== 'edit') {
-      _renderMemoryDetail(_currentMemorySection);
-    }
-  } catch(e) {
+    await _runPanelRefresh('memory', async (panelState) => {
+      const next = await loadMemoryData(mode);
+      patchMemoryView(panelState.currentModel, next, mode);
+      panelState.currentModel = next;
+      _panelRememberSelection(panelState, _currentMemorySection || '');
+    });
+  } catch (e) {
     if (panel) panel.innerHTML = `<div style="padding:12px;color:var(--accent);font-size:12px">${esc(t('error_prefix'))}${esc(e.message)}</div>`;
   }
 }

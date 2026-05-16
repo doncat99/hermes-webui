@@ -49,8 +49,41 @@ def test_kanban_has_sidebar_panel_and_main_board_mounts():
 
 def test_switch_panel_lazy_loads_kanban_and_toggles_main_view():
     assert "'kanban'" in re.search(r"\[[^\]]+\]\.forEach\(p => \{\s*mainEl\.classList", PANELS).group(0)
-    assert "if (nextPanel === 'kanban') await loadKanban();" in PANELS
+    assert "if (nextPanel === 'kanban') { await mountKanbanPanel(); await loadKanban(); }" in PANELS
     assert "if (_currentPanel === 'kanban') await loadKanban();" in PANELS
+
+
+def test_kanban_live_refresh_does_not_reinitialize_stream_or_board_list():
+    assert "async function loadKanban(animate, options)" in PANELS
+    assert "async function mountKanbanPanel()" in PANELS
+    assert "async function loadKanbanData(mode, options)" in PANELS
+    assert "function patchKanbanView(prev, next, mode)" in PANELS
+    assert "await _runPanelRefresh('kanban'" in PANELS
+    assert "const includeBoardList = opts.includeBoardList !== false;" in PANELS
+    assert "const includeAssignees = opts.includeAssignees !== false;" in PANELS
+    assert "const includeConfig = opts.includeConfig !== false;" in PANELS
+    assert "const includeLiveSetup = opts.includeLiveSetup !== false;" in PANELS
+    assert "if (includeBoardList) await loadKanbanBoards();" in PANELS
+    assert "if (next && next.includeLiveSetup) _kanbanStartPolling();" in PANELS
+    assert "await loadKanban(false, {includeBoardList: false, includeAssignees: false, includeConfig: false, includeLiveSetup: false});" in PANELS
+    assert "const config = (includeConfig || !_kanbanConfig)" in PANELS
+    assert "if (config) _kanbanConfig = config;" in PANELS
+    assert "if (_kanbanEventSource) return;" in PANELS
+    assert "let _kanbanRefreshInFlight = false;" in PANELS
+    assert "let _kanbanRefreshRerunRequested = false;" in PANELS
+    assert "if (_kanbanRefreshInFlight) {" in PANELS
+    assert "_kanbanRefreshRerunRequested = true;" in PANELS
+
+    switch_body = re.search(r"async function switchKanbanBoard\([^)]*\)\{(.*?)\n\}", PANELS, re.DOTALL)
+    assert switch_body
+    assert "await loadKanban(true);" in switch_body.group(1)
+    assert "await loadKanbanBoards();" not in switch_body.group(1)
+    assert "_kanbanStartPolling();" not in switch_body.group(1)
+
+    archive_body = re.search(r"async function archiveKanbanBoard\(\)\{(.*?)\n\}", PANELS, re.DOTALL)
+    assert archive_body
+    assert "await loadKanban(true);" in archive_body.group(1)
+    assert "await loadKanbanBoards();" not in archive_body.group(1)
 
 
 def test_kanban_frontend_uses_relative_api_endpoints():

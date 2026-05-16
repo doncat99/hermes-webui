@@ -14,14 +14,32 @@ Supported operations:
 from __future__ import annotations
 
 import json
+import os
+import re
+import sys
+import threading
 import time
 from dataclasses import asdict, is_dataclass
+from pathlib import Path
 from urllib.parse import parse_qs, unquote
 
 from api.helpers import bad, j
 
 BOARD_COLUMNS = ["triage", "todo", "ready", "running", "blocked", "done"]
 _TASK_PREFIX = "/api/kanban/tasks/"
+_ONTOSYNTH_TENANT_PREFIX = "ontosynth::"
+_ONTOSYNTH_RUN_KEY_LINE_RE = re.compile(r"(?im)^Run key:\s*([^\s]+)\s*$")
+_ONTOSYNTH_REQUEST_PACKET_RE = re.compile(
+    r"(?im)^Request packet:\s+.*?/([^/\s]+)\.yaml\s*$"
+)
+_ONTOSYNTH_TITLE_RUN_RE = re.compile(r"\brun\s+([A-Za-z0-9_.:-]+)\b", re.IGNORECASE)
+_ONTOSYNTH_RECONCILE_LOCK = threading.Lock()
+_ONTOSYNTH_RECONCILE_STARTED = False
+_ONTOSYNTH_RECONCILE_CURSOR_BY_BOARD: dict[str, int] = {}
+_ONTOSYNTH_RECONCILE_POLL_SECONDS = max(
+    float(os.getenv("ONTOSYNTH_KANBAN_RECONCILE_POLL_SECONDS", "2.0") or 2.0),
+    0.5,
+)
 
 # ONTOSYNTH-PROFILE-SCOPE-BEGIN
 def _ontosynth_webui_profile_scope():
@@ -160,6 +178,167 @@ def _ontosynth_webui_row_matches_scope_profile(row_profile, active_profile):
     row = str(row_profile or "default")
     return row in allowed or (row == "default" and bool(payload.get("include_default_profile")))
 # ONTOSYNTH-PROFILE-SCOPE-END
+
+
+def _ontosynth_repo_root() -> Path | None:
+    raw = os.getenv("ONTOSYNTH_REPO_ROOT", "").strip()
+    candidates: list[Path] = []
+    if raw:
+        candidates.append(Path(raw).expanduser())
+    try:
+        module_path = Path(__file__).resolve()
+        candidates.extend(module_path.parents)
+    except Exception:
+        pass
+    try:
+        cwd = Path.cwd().resolve()
+        candidates.extend([cwd, *cwd.parents])
+    except Exception:
+        pass
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        marker = candidate / "kernel" / "runtime" / "application" / "kanban_native_runtime_reconciler.py"
+        if marker.exists():
+            return candidate.resolve()
+    return None
+
+
+def _refresh_ontosynth_run_artifacts(*, project_key: str, run_key: str) -> bool:
+    repo_root = _ontosynth_repo_root()
+    if repo_root is None:
+        return False
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+    try:
+        from kernel.runtime.application.kanban_native_runtime_reconciler import (
+            refresh_kanban_native_run_artifacts,
+        )
+    except Exception:
+        return False
+    try:
+        refresh_kanban_native_run_artifacts(
+            repository_root=repo_root,
+            project_key=project_key,
+            run_key=run_key,
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _ontosynth_project_key_for_task(task) -> str | None:
+    tenant = str(getattr(task, "tenant", "") or "").strip()
+    if tenant.startswith(_ONTOSYNTH_TENANT_PREFIX):
+        project_key = tenant[len(_ONTOSYNTH_TENANT_PREFIX):].strip()
+        return project_key or None
+    body = str(getattr(task, "body", "") or "")
+    match = re.search(r"/projects/([^/\s]+)/runtime/run_requests/", body)
+    if match:
+        return match.group(1).strip() or None
+    return None
+
+
+def _ontosynth_run_key_for_task(task) -> str | None:
+    body = str(getattr(task, "body", "") or "")
+    title = str(getattr(task, "title", "") or "")
+    for pattern in (_ONTOSYNTH_RUN_KEY_LINE_RE, _ONTOSYNTH_REQUEST_PACKET_RE):
+        match = pattern.search(body)
+        if match:
+            run_key = str(match.group(1) or "").strip().rstrip(".")
+            if run_key:
+                return run_key
+    for source in (title, body):
+        match = _ONTOSYNTH_TITLE_RUN_RE.search(source)
+        if match:
+            run_key = str(match.group(1) or "").strip().rstrip(".")
+            if run_key:
+                return run_key
+    return None
+
+
+def _poll_ontosynth_runtime_reconciliation(
+    *,
+    board: str,
+    cursor_state: dict[str, int] | None = None,
+    limit: int = 100,
+) -> dict[str, object]:
+    kb = _kb()
+    state = cursor_state if cursor_state is not None else _ONTOSYNTH_RECONCILE_CURSOR_BY_BOARD
+    since = int(state.get(board, 0) or 0)
+    refreshed: list[dict[str, str]] = []
+    seen_runs: set[tuple[str, str]] = set()
+    with _conn(board=board) as conn:
+        rows = conn.execute(
+            "SELECT id, task_id FROM task_events WHERE id > ? ORDER BY id ASC LIMIT ?",
+            (since, int(limit)),
+        ).fetchall()
+        max_seen = since
+        for row in rows:
+            event_id = int(row["id"] or 0)
+            task_id = str(row["task_id"] or "").strip()
+            if event_id > max_seen:
+                max_seen = event_id
+            if not task_id:
+                continue
+            task = kb.get_task(conn, task_id)
+            if task is None:
+                continue
+            project_key = _ontosynth_project_key_for_task(task)
+            run_key = _ontosynth_run_key_for_task(task)
+            if not project_key or not run_key:
+                continue
+            run_ref = (project_key, run_key)
+            if run_ref in seen_runs:
+                continue
+            if not _refresh_ontosynth_run_artifacts(
+                project_key=project_key,
+                run_key=run_key,
+            ):
+                continue
+            seen_runs.add(run_ref)
+            refreshed.append(
+                {
+                    "board": board,
+                    "task_id": task_id,
+                    "project_key": project_key,
+                    "run_key": run_key,
+                }
+            )
+        state[board] = max_seen
+    return {"board": board, "since": since, "cursor": state.get(board, since), "refreshed": refreshed}
+
+
+def _ontosynth_reconcile_monitor_loop() -> None:
+    while True:
+        try:
+            _poll_ontosynth_runtime_reconciliation(board="knowledge-governance")
+        except Exception:
+            pass
+        time.sleep(_ONTOSYNTH_RECONCILE_POLL_SECONDS)
+
+
+def _ensure_ontosynth_reconcile_monitor_started() -> None:
+    global _ONTOSYNTH_RECONCILE_STARTED
+    if _ONTOSYNTH_RECONCILE_STARTED:
+        return
+    repo_root = _ontosynth_repo_root()
+    if repo_root is None:
+        return
+    with _ONTOSYNTH_RECONCILE_LOCK:
+        if _ONTOSYNTH_RECONCILE_STARTED:
+            return
+        thread = threading.Thread(
+            target=_ontosynth_reconcile_monitor_loop,
+            name="ontosynth-kanban-reconcile",
+            daemon=True,
+        )
+        thread.start()
+        _ONTOSYNTH_RECONCILE_STARTED = True
 
 def _kb():
     from hermes_cli import kanban_db as kb
@@ -1225,6 +1404,7 @@ def handle_kanban_get(handler, parsed) -> bool | None:
     """
     path = parsed.path
     try:
+        _ensure_ontosynth_reconcile_monitor_started()
         # Multi-board management endpoints — these do NOT take a board arg
         # because they operate on the on-disk board collection itself, not
         # on a single board's tasks.
@@ -1277,6 +1457,7 @@ def handle_kanban_post(handler, parsed, body) -> bool | None:
     three-valued ``True | None | False`` contract (#1843)."""
     path = parsed.path
     try:
+        _ensure_ontosynth_reconcile_monitor_started()
         # Multi-board management endpoints — `_create_board_payload` and
         # `_switch_board_payload` operate on the on-disk board collection,
         # not on a single board's tasks.
@@ -1330,6 +1511,7 @@ def handle_kanban_patch(handler, parsed, body) -> bool | None:
     three-valued ``True | None | False`` contract (#1843)."""
     path = parsed.path
     try:
+        _ensure_ontosynth_reconcile_monitor_started()
         # /boards/<slug> routes operate on the on-disk board collection
         # itself — the slug travels in the URL path, not via ?board=. Match
         # them BEFORE resolving the board param so a stray ?board=ghost in
@@ -1368,6 +1550,7 @@ def handle_kanban_delete(handler, parsed, body) -> bool | None:
     three-valued ``True | None | False`` contract (#1843)."""
     path = parsed.path
     try:
+        _ensure_ontosynth_reconcile_monitor_started()
         # Same routing reorder as PATCH: /boards/<slug> path-routed first,
         # so a stray ?board=ghost can't 404 a legitimate board archive.
         _BOARDS_PREFIX = "/api/kanban/boards/"

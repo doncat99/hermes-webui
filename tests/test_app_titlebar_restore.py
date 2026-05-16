@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,3 +25,15 @@ def test_app_titlebar_subtitle_shows_message_count_again():
 
 def test_queue_updates_do_not_hijack_app_titlebar_subtitle():
     assert "_syncQueueTitlebar" not in UI_JS
+
+
+def test_switch_panel_updates_titlebar_before_async_panel_loads():
+    match = re.search(
+        r"async function switchPanel\(name, opts = \{\}\) \{(.*?)syncAppTitlebar\(\);(.*?)if \(nextPanel === 'tasks'\)",
+        PANELS_JS,
+        re.DOTALL,
+    )
+    assert match, (
+        "switchPanel() must sync the app titlebar before async panel loaders run, "
+        "so slow tabs do not leave the previous panel title visible."
+    )

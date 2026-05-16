@@ -57,6 +57,22 @@ def test_panels_js_served(cleanup_test_sessions):
     assert "async function loadSkills(" in src
     assert "async function loadMemory(" in src
 
+
+def test_panel_loaders_and_patch_entrypoints_exist():
+    src = pathlib.Path("static/panels.js").read_text(encoding="utf-8")
+    for name in (
+        "mountSkillsPanel",
+        "loadSkillsData",
+        "patchSkillsView",
+        "mountMemoryPanel",
+        "loadMemoryData",
+        "patchMemoryView",
+        "mountTasksPanel",
+        "loadTasksData",
+        "patchTasksView",
+    ):
+        assert name in src
+
 def test_boot_js_served(cleanup_test_sessions):
     src = get_text("/static/boot.js")
     assert "btnSend" in src

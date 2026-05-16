@@ -455,6 +455,87 @@ def test_kanban_patch_task_payload_updates_status_title_and_comment(monkeypatch)
     assert detail["comments"][0]["body"] == "Looks done"
 
 
+def test_ontosynth_task_events_trigger_runtime_reconciliation(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    kb = bridge._kb()
+    kb.tasks = [
+        FakeTask(
+            "t_run",
+            "Implement shell sidebar suppression",
+            "done",
+            "tester",
+            tenant="ontosynth::knowledge_governance_console",
+            body=(
+                "Testing task for OntoSynth Knowledge Governance Console run "
+                "knowledge_structure_shell_sidebar_impl_v1.\n"
+                "Request packet: /Users/huangdon/Documents/OntoSynth/projects/"
+                "knowledge_governance_console/runtime/run_requests/"
+                "knowledge_structure_shell_sidebar_impl_v1.yaml\n"
+            ),
+        )
+    ]
+    kb.events = [FakeEvent(11, "t_run", None, "completed", {"status": "done"}, 123)]
+
+    refresh_calls = []
+    monkeypatch.setattr(
+        bridge,
+        "_refresh_ontosynth_run_artifacts",
+        lambda *, project_key, run_key: refresh_calls.append((project_key, run_key)) or True,
+    )
+
+    state = {"default": 0}
+    payload = bridge._poll_ontosynth_runtime_reconciliation(
+        board="default",
+        cursor_state=state,
+        limit=20,
+    )
+
+    assert refresh_calls == [
+        ("knowledge_governance_console", "knowledge_structure_shell_sidebar_impl_v1")
+    ]
+    assert payload["refreshed"] == [
+        {
+            "board": "default",
+            "task_id": "t_run",
+            "project_key": "knowledge_governance_console",
+            "run_key": "knowledge_structure_shell_sidebar_impl_v1",
+        }
+    ]
+    assert state["default"] == 11
+
+
+def test_non_ontosynth_task_events_do_not_trigger_runtime_reconciliation(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    kb = bridge._kb()
+    kb.tasks = [
+        FakeTask(
+            "t_plain",
+            "Normal task",
+            "done",
+            "tester",
+            tenant="ops",
+            body="Request packet: /tmp/not-ontosynth.yaml\n",
+        )
+    ]
+    kb.events = [FakeEvent(12, "t_plain", None, "completed", {"status": "done"}, 123)]
+
+    refresh_calls = []
+    monkeypatch.setattr(
+        bridge,
+        "_refresh_ontosynth_run_artifacts",
+        lambda *, project_key, run_key: refresh_calls.append((project_key, run_key)) or True,
+    )
+
+    payload = bridge._poll_ontosynth_runtime_reconciliation(
+        board="default",
+        cursor_state={"default": 0},
+        limit=20,
+    )
+
+    assert refresh_calls == []
+    assert payload["refreshed"] == []
+
+
 def test_kanban_link_payload_adds_parent_child_relationship(monkeypatch):
     bridge = _load_bridge(monkeypatch)
 
@@ -501,6 +582,11 @@ def test_routes_dispatches_api_kanban_post_to_bridge():
 
 def test_kanban_dashboard_core_api_exposes_stats_assignees_config_and_logs(monkeypatch):
     bridge = _load_bridge(monkeypatch)
+    monkeypatch.setattr(
+        bridge,
+        "filter_assignees_for_ontosynth_webui_scope",
+        lambda assignees: assignees,
+    )
 
     stats = bridge._stats_payload()
     assignees = bridge._assignees_payload()
