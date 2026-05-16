@@ -451,6 +451,631 @@ def _materialized_skill_details_for_profile_home(
     return details
 
 
+
+def _knowledge_structure_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _knowledge_structure_repo_root() -> Path:
+    env_root = os.getenv("ONTOSYNTH_REPO_ROOT", "").strip()
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+    return Path(__file__).resolve().parents[3]
+
+
+def _knowledge_structure_canonical_paths(project_key: str = "knowledge_governance_console") -> dict[str, Path]:
+    repo_root = _knowledge_structure_repo_root()
+    return {
+        "operator_status": repo_root / "artifacts" / "operator" / "status.json",
+        "project_data_catalog": repo_root / "artifacts" / "ontology" / "project_data_catalog.json",
+        "project_data_view": repo_root / "artifacts" / "ontology" / project_key / "project_data_view.json",
+    }
+
+
+def _knowledge_structure_read_json(path: Path) -> tuple[object, str | None]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), None
+    except FileNotFoundError:
+        return {}, "missing"
+    except json.JSONDecodeError:
+        return {}, "invalid_json"
+    except OSError as exc:
+        return {}, f"unreadable:{exc.__class__.__name__}"
+
+
+def _knowledge_structure_truth_bundle(project_key: str = "knowledge_governance_console") -> dict[str, object]:
+    paths = _knowledge_structure_canonical_paths(project_key)
+    payloads: dict[str, object] = {}
+    errors: dict[str, str] = {}
+    for key, path in paths.items():
+        payload, error = _knowledge_structure_read_json(path)
+        payloads[key] = payload if isinstance(payload, (dict, list)) else {}
+        if error:
+            errors[key] = error
+    return {"paths": paths, "payloads": payloads, "errors": errors}
+
+
+def _knowledge_structure_source_uri(path: Path) -> str:
+    try:
+        repo_root = _knowledge_structure_repo_root()
+        return str(path.resolve().relative_to(repo_root))
+    except Exception:
+        return str(path)
+
+
+def _knowledge_structure_excerpt(value: object, *, limit: int = 260) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            text = str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        return text[: limit - 1].rstrip() + "…"
+    return text or "canonical value present without textual projection"
+
+
+def _knowledge_structure_get_path(payload: object, pointer: str) -> object:
+    cur = payload
+    for part in [p for p in pointer.strip("/").split("/") if p]:
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        elif isinstance(cur, list):
+            try:
+                cur = cur[int(part)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+    return cur
+
+
+def _knowledge_structure_provenance_entry(
+    *,
+    provenance_id: str,
+    source_key: str,
+    pointer: str,
+    source_kind: str,
+    role: str = "canonical_truth_read_model",
+    trust_level: str = "canonical",
+    bundle: dict[str, object],
+) -> dict[str, object]:
+    paths = bundle.get("paths") or {}
+    payloads = bundle.get("payloads") or {}
+    path = paths.get(source_key) if isinstance(paths, dict) else None
+    source_payload = payloads.get(source_key, {}) if isinstance(payloads, dict) else {}
+    value = _knowledge_structure_get_path(source_payload, pointer) if pointer else source_payload
+    return {
+        "provenance_id": provenance_id,
+        "source_kind": source_kind,
+        "source_uri": _knowledge_structure_source_uri(path) if isinstance(path, Path) else str(path or source_key),
+        "json_pointer": pointer or "/",
+        "excerpt": _knowledge_structure_excerpt(value),
+        "captured_at": _knowledge_structure_now_iso(),
+        "role": role,
+        "trust_level": trust_level,
+    }
+
+
+def _knowledge_structure_truth_status(status: str, ready: object = None) -> str:
+    status_text = str(status or "").strip().lower()
+    if status_text == "ready" or ready is True:
+        return "governed"
+    if status_text:
+        return "runtime_evidence_only"
+    return "canonical_absence"
+
+
+def _knowledge_structure_absence(field: str, reason: str = "not projected by canonical truth read model") -> dict[str, str]:
+    return {"field": field, "state": "canonical_absence", "reason": reason}
+
+
+def _knowledge_structure_make_item(
+    *,
+    item_id: str,
+    title: str,
+    summary: str,
+    item_type: str,
+    lifecycle: str,
+    truth_status: str,
+    provenance_ids: list[str],
+    updated_at: str,
+    relationship_count: int = 0,
+    has_pending_change: bool = False,
+    confidence: float | None = None,
+    canonical_absence: list[dict[str, str]] | None = None,
+    governance_chain: list[dict[str, object]] | None = None,
+    distillation_category: str | None = None,
+    distillation_scope: str | None = None,
+    governance_decision: str | None = None,
+    proposed_by: str | None = None,
+) -> dict[str, object]:
+    item = {
+        "item_id": item_id,
+        "title": title,
+        "summary": summary,
+        "item_type": item_type,
+        "lifecycle": lifecycle,
+        "truth_status": truth_status,
+        "confidence": confidence,
+        "source_count": len(provenance_ids),
+        "relationship_count": relationship_count,
+        "has_pending_change": has_pending_change,
+        "updated_at": updated_at,
+        "provenance_ids": provenance_ids,
+        "canonical_absence": canonical_absence or [],
+        "governance_chain": governance_chain or [],
+        "distillation_category": distillation_category or "none",
+        "distillation_scope": distillation_scope or "none",
+        "governance_decision": governance_decision or "unknown",
+        "proposed_by": proposed_by or "unknown",
+    }
+    return item
+
+
+def _knowledge_structure_governance_chain(operator_status: dict[str, object], project_key: str) -> list[dict[str, object]]:
+    chains = (((operator_status or {}).get("knowledge_governance_flow") or {}).get("chains") or [])
+    result: list[dict[str, object]] = []
+    for idx, chain in enumerate(chains):
+        if not isinstance(chain, dict):
+            continue
+        candidate_key = str(chain.get("candidate_key") or "")
+        if project_key not in candidate_key and not candidate_key.startswith("kc.doctrine"):
+            continue
+        result.append(
+            {
+                "chain_id": candidate_key or f"operator_status.chain.{idx}",
+                "decision": str(chain.get("decision") or "canonical_absence"),
+                "actual_decider": str(chain.get("actual_decider") or "canonical_absence"),
+                "application_status": str(chain.get("application_status") or "canonical_absence"),
+                "write_back_status": str(chain.get("write_back_status") or "canonical_absence"),
+                "source_refs": list(chain.get("source_refs") or [])[:5],
+                "evidence_refs": list(chain.get("evidence_refs") or [])[:5],
+            }
+        )
+        if len(result) >= 4:
+            break
+    return result
+
+
+def _knowledge_structure_build_model(project_key: str = "knowledge_governance_console") -> dict[str, object]:
+    bundle = _knowledge_structure_truth_bundle(project_key)
+    payloads = bundle["payloads"] if isinstance(bundle.get("payloads"), dict) else {}
+    errors = bundle["errors"] if isinstance(bundle.get("errors"), dict) else {}
+    operator_status = payloads.get("operator_status") if isinstance(payloads.get("operator_status"), dict) else {}
+    catalog = payloads.get("project_data_catalog") if isinstance(payloads.get("project_data_catalog"), dict) else {}
+    view = payloads.get("project_data_view") if isinstance(payloads.get("project_data_view"), dict) else {}
+    generated_at = _knowledge_structure_now_iso()
+
+    governance_chain = _knowledge_structure_governance_chain(operator_status, project_key)
+    provenance = [
+        _knowledge_structure_provenance_entry(provenance_id="prov:operator-status:root", source_key="operator_status", pointer="/", source_kind="operator_status", bundle=bundle),
+        _knowledge_structure_provenance_entry(provenance_id="prov:project-data-catalog:root", source_key="project_data_catalog", pointer="/", source_kind="project_data_catalog", bundle=bundle),
+        _knowledge_structure_provenance_entry(provenance_id="prov:project-data-view:root", source_key="project_data_view", pointer="/", source_kind="project_data_view", bundle=bundle),
+        _knowledge_structure_provenance_entry(provenance_id="prov:project-data-view:goal", source_key="project_data_view", pointer="/goal", source_kind="project_goal", bundle=bundle),
+        _knowledge_structure_provenance_entry(provenance_id="prov:project-data-view:goal-alignment", source_key="project_data_view", pointer="/goal_alignment", source_kind="goal_alignment", bundle=bundle),
+        _knowledge_structure_provenance_entry(provenance_id="prov:operator-status:governance-flow", source_key="operator_status", pointer="/knowledge_governance_flow", source_kind="governance_chain", bundle=bundle),
+    ]
+    provenance_by_id = {str(p["provenance_id"]): p for p in provenance}
+
+    goal = view.get("goal") if isinstance(view.get("goal"), dict) else {}
+    ontology_facts = view.get("ontology_facts") if isinstance(view.get("ontology_facts"), dict) else {}
+    goal_alignment = view.get("goal_alignment") if isinstance(view.get("goal_alignment"), dict) else {}
+    coverage = goal_alignment.get("coverage") if isinstance(goal_alignment.get("coverage"), dict) else {}
+    requirements = goal_alignment.get("requirements") if isinstance(goal_alignment.get("requirements"), list) else []
+    execution_projection = view.get("execution_projection") if isinstance(view.get("execution_projection"), dict) else {}
+    latest_projection = execution_projection.get("latest_kanban_projection") if isinstance(execution_projection.get("latest_kanban_projection"), dict) else {}
+    runtime_status = latest_projection.get("runtime_status") if isinstance(latest_projection.get("runtime_status"), dict) else {}
+    promotion_observability = (
+        view.get("promotion_observability")
+        if isinstance(view.get("promotion_observability"), list)
+        else []
+    )
+    catalog_promotion_accountability = (
+        catalog.get("promotion_accountability")
+        if isinstance(catalog.get("promotion_accountability"), list)
+        else []
+    )
+    catalog_project = ((catalog.get("projects") or {}).get(project_key) if isinstance(catalog.get("projects"), dict) else {}) or {}
+
+    items: list[dict[str, object]] = []
+    items.append(_knowledge_structure_make_item(
+        item_id=f"ks:project:{project_key}:goal",
+        title=str(goal.get("goal_key") or f"{project_key} goal"),
+        summary=str(goal.get("goal_statement") or "Canonical goal statement is absent from project_data_view."),
+        item_type="goal_contract",
+        lifecycle="accepted" if view.get("ready") is True else "candidate",
+        truth_status=_knowledge_structure_truth_status(str(view.get("status") or ""), view.get("ready")),
+        provenance_ids=["prov:project-data-view:goal", "prov:project-data-view:root"],
+        updated_at=generated_at,
+        relationship_count=2,
+        confidence=None,
+        canonical_absence=[] if goal.get("goal_statement") else [_knowledge_structure_absence("goal.goal_statement")],
+        governance_chain=governance_chain,
+    ))
+    items.append(_knowledge_structure_make_item(
+        item_id=f"ks:project:{project_key}:ontology-facts",
+        title="Ontology fact projection",
+        summary=f"{ontology_facts.get('fact_count', 0)} canonical facts across {len(ontology_facts.get('subject_type_counts') or {})} subject types and {len(ontology_facts.get('predicate_counts') or {})} predicates.",
+        item_type="fact_projection",
+        lifecycle="accepted" if (ontology_facts.get("fact_count") or 0) else "candidate",
+        truth_status="governed" if (ontology_facts.get("fact_count") or 0) else "canonical_absence",
+        provenance_ids=["prov:project-data-view:root"],
+        updated_at=generated_at,
+        relationship_count=len(ontology_facts.get("predicate_counts") or {}),
+        confidence=None,
+        canonical_absence=[] if (ontology_facts.get("fact_count") or 0) else [_knowledge_structure_absence("ontology_facts.fact_count")],
+        governance_chain=governance_chain,
+    ))
+    items.append(_knowledge_structure_make_item(
+        item_id=f"ks:project:{project_key}:goal-alignment",
+        title="Goal-alignment coverage",
+        summary=f"{coverage.get('met_requirement_count', 0)}/{coverage.get('required_fact_count', 0)} requirements met; {coverage.get('missing_requirement_count', 0)} missing requirements.",
+        item_type="coverage_report",
+        lifecycle="accepted" if coverage.get("missing_requirement_count") == 0 else "candidate",
+        truth_status=_knowledge_structure_truth_status(str(view.get("status") or ""), view.get("ready")),
+        provenance_ids=["prov:project-data-view:goal-alignment"],
+        updated_at=generated_at,
+        relationship_count=len(requirements),
+        confidence=None,
+        canonical_absence=[] if requirements else [_knowledge_structure_absence("goal_alignment.requirements")],
+        governance_chain=governance_chain,
+    ))
+    for idx, req in enumerate(requirements[:8]):
+        if not isinstance(req, dict):
+            continue
+        req_key = str(req.get("requirement_key") or f"requirement_{idx}")
+        pid = f"prov:project-data-view:requirement:{req_key}"
+        provenance_by_id[pid] = _knowledge_structure_provenance_entry(
+            provenance_id=pid,
+            source_key="project_data_view",
+            pointer=f"/goal_alignment/requirements/{idx}",
+            source_kind="goal_requirement",
+            bundle=bundle,
+        )
+        status = str(req.get("status") or "canonical_absence")
+        items.append(_knowledge_structure_make_item(
+            item_id=f"ks:requirement:{req_key}",
+            title=req_key,
+            summary=str(req.get("description") or "Canonical requirement description absent."),
+            item_type="requirement",
+            lifecycle="accepted" if status == "met" else "candidate",
+            truth_status="governed" if status == "met" else "runtime_evidence_only",
+            provenance_ids=[pid, "prov:project-data-view:goal-alignment"],
+            updated_at=generated_at,
+            relationship_count=len(req.get("matching_fact_keys") or []),
+            has_pending_change=status != "met",
+            confidence=None,
+            canonical_absence=[] if req.get("description") else [_knowledge_structure_absence("requirement.description")],
+            governance_chain=governance_chain,
+        ))
+    items.append(_knowledge_structure_make_item(
+        item_id=f"ks:project:{project_key}:runtime-projection",
+        title="Kanban runtime projection",
+        summary=f"Projection {latest_projection.get('projection_status') or 'canonical_absence'} on board {latest_projection.get('board') or 'canonical_absence'}; runtime state {runtime_status.get('runtime_state') or 'canonical_absence'}.",
+        item_type="runtime_projection",
+        lifecycle="accepted" if latest_projection.get("projection_status") == "projected" else "candidate",
+        truth_status="derived_index" if latest_projection else "canonical_absence",
+        provenance_ids=["prov:project-data-view:root"],
+        updated_at=generated_at,
+        relationship_count=len(latest_projection.get("task_refs") or []),
+        has_pending_change=str(runtime_status.get("runtime_state") or "") not in {"completed", "done"},
+        confidence=None,
+        canonical_absence=[] if latest_projection else [_knowledge_structure_absence("execution_projection.latest_kanban_projection")],
+        governance_chain=governance_chain,
+    ))
+    items.append(_knowledge_structure_make_item(
+        item_id=f"ks:project:{project_key}:catalog-entry",
+        title="Project data catalog entry",
+        summary=f"Catalog status {catalog_project.get('status') or catalog.get('status') or 'canonical_absence'}; facts {catalog_project.get('fact_count', catalog.get('fact_count', 'canonical_absence'))}; governed data assets {catalog_project.get('governed_data_asset_count', catalog.get('governed_data_asset_count', 'canonical_absence'))}.",
+        item_type="catalog_entry",
+        lifecycle="accepted" if (catalog_project.get("ready") is True or catalog.get("ready") is True) else "candidate",
+        truth_status=_knowledge_structure_truth_status(str(catalog_project.get("status") or catalog.get("status") or ""), catalog_project.get("ready", catalog.get("ready"))),
+        provenance_ids=["prov:project-data-catalog:root"],
+        updated_at=generated_at,
+        relationship_count=1,
+        confidence=None,
+        canonical_absence=[] if catalog_project else [_knowledge_structure_absence(f"projects.{project_key}")],
+        governance_chain=governance_chain,
+    ))
+    promotion_item_ids: set[str] = set()
+    for idx, promotion in enumerate(promotion_observability[:24]):
+        if not isinstance(promotion, dict):
+            continue
+        candidate_key = str(promotion.get("candidate_key") or f"promotion_{idx}")
+        promotion_item_ids.add(candidate_key)
+        pid = f"prov:project-data-view:promotion:{idx}"
+        provenance_by_id[pid] = _knowledge_structure_provenance_entry(
+            provenance_id=pid,
+            source_key="project_data_view",
+            pointer=f"/promotion_observability/{idx}",
+            source_kind="promotion_observability",
+            bundle=bundle,
+        )
+        distillation_category = str(promotion.get("distillation_category") or "unknown")
+        distillation_scope = str(promotion.get("distillation_scope") or "unknown")
+        application_status = str(promotion.get("application_status") or "not_applied")
+        write_back_status = str(promotion.get("write_back_status") or "not_written")
+        actual_decider = str(promotion.get("actual_decider") or "unknown")
+        decision = str(promotion.get("decision") or "unknown")
+        lifecycle = "accepted" if write_back_status == "written" else "proposed"
+        truth_status = "governed" if write_back_status == "written" else "proposal_overlay"
+        governance_entry = {
+            "chain_id": candidate_key,
+            "decision": decision,
+            "actual_decider": actual_decider,
+            "application_status": application_status,
+            "write_back_status": write_back_status,
+            "source_refs": list(promotion.get("source_refs") or [])[:5],
+            "evidence_refs": list(promotion.get("evidence_refs") or [])[:5],
+            "allowed_approvers": list(promotion.get("allowed_approvers") or [])[:5],
+        }
+        item = _knowledge_structure_make_item(
+            item_id=f"ks:promotion:{candidate_key}",
+            title=candidate_key,
+            summary=(
+                f"{distillation_category} / {distillation_scope} · {decision} by {actual_decider} "
+                f"· writeback {write_back_status} · target {promotion.get('target_path') or 'canonical_absence'}."
+            ),
+            item_type="promotion_candidate",
+            lifecycle=lifecycle,
+            truth_status=truth_status,
+            provenance_ids=[pid, "prov:operator-status:governance-flow", "prov:project-data-view:root"],
+            updated_at=generated_at,
+            relationship_count=2,
+            has_pending_change=write_back_status != "written",
+            confidence=None,
+            canonical_absence=[] if distillation_category != "unknown" else [_knowledge_structure_absence("promotion_observability.distillation_category")],
+            governance_chain=[governance_entry],
+            distillation_category=distillation_category,
+            distillation_scope=distillation_scope,
+            governance_decision=decision,
+            proposed_by=str(promotion.get("proposed_by") or "unknown"),
+        )
+        item["owner_project_key"] = project_key
+        items.append(item)
+    for idx, promotion in enumerate(catalog_promotion_accountability[:48]):
+        if not isinstance(promotion, dict):
+            continue
+        candidate_key = str(promotion.get("candidate_key") or f"catalog_promotion_{idx}")
+        if candidate_key in promotion_item_ids:
+            continue
+        promotion_item_ids.add(candidate_key)
+        pid = f"prov:project-data-catalog:promotion:{idx}"
+        provenance_by_id[pid] = _knowledge_structure_provenance_entry(
+            provenance_id=pid,
+            source_key="project_data_catalog",
+            pointer=f"/promotion_accountability/{idx}",
+            source_kind="promotion_accountability",
+            bundle=bundle,
+        )
+        distillation_category = str(promotion.get("distillation_category") or "unknown")
+        distillation_scope = str(promotion.get("distillation_scope") or "unknown")
+        application_status = str(promotion.get("application_status") or "not_applied")
+        write_back_status = str(promotion.get("write_back_status") or "not_written")
+        actual_decider = str(promotion.get("actual_decider") or "unknown")
+        decision = str(promotion.get("decision") or "unknown")
+        owner_project_key = str(promotion.get("project_key") or "platform")
+        lifecycle = "accepted" if write_back_status == "written" else "proposed"
+        truth_status = "governed" if write_back_status == "written" else "proposal_overlay"
+        governance_entry = {
+            "chain_id": candidate_key,
+            "decision": decision,
+            "actual_decider": actual_decider,
+            "application_status": application_status,
+            "write_back_status": write_back_status,
+            "source_refs": list(promotion.get("source_refs") or [])[:5],
+            "evidence_refs": list(promotion.get("evidence_refs") or [])[:5],
+            "allowed_approvers": list(promotion.get("allowed_approvers") or [])[:5],
+        }
+        item = _knowledge_structure_make_item(
+            item_id=f"ks:promotion:{candidate_key}",
+            title=candidate_key,
+            summary=(
+                f"{owner_project_key} · {distillation_category} / {distillation_scope} "
+                f"· {decision} by {actual_decider} · writeback {write_back_status} "
+                f"· target {promotion.get('target_path') or 'canonical_absence'}."
+            ),
+            item_type="promotion_candidate",
+            lifecycle=lifecycle,
+            truth_status=truth_status,
+            provenance_ids=[pid, "prov:project-data-catalog:root"],
+            updated_at=generated_at,
+            relationship_count=1,
+            has_pending_change=write_back_status != "written",
+            confidence=None,
+            canonical_absence=[] if distillation_category != "unknown" else [_knowledge_structure_absence("promotion_accountability.distillation_category")],
+            governance_chain=[governance_entry],
+            distillation_category=distillation_category,
+            distillation_scope=distillation_scope,
+            governance_decision=decision,
+            proposed_by=str(promotion.get("proposed_by") or "unknown"),
+        )
+        item["owner_project_key"] = owner_project_key
+        items.append(item)
+
+    relationships: list[dict[str, object]] = []
+    def rel(rid: str, kind: str, from_id: str, to_id: str, status: str, prov_ids: list[str]):
+        relationships.append({
+            "relationship_id": rid,
+            "kind": kind,
+            "from_item_id": from_id,
+            "to_item_id": to_id,
+            "status": status,
+            "provenance_ids": prov_ids,
+            "created_by": "canonical_truth_read_model",
+        })
+    goal_id = f"ks:project:{project_key}:goal"
+    rel("rel:goal-supported-by-alignment", "supported_by", goal_id, f"ks:project:{project_key}:goal-alignment", "accepted", ["prov:project-data-view:goal-alignment"])
+    rel("rel:goal-grounded-in-facts", "supported_by", goal_id, f"ks:project:{project_key}:ontology-facts", "accepted", ["prov:project-data-view:root"])
+    rel("rel:catalog-points-to-view", "derived_from", f"ks:project:{project_key}:catalog-entry", goal_id, "accepted", ["prov:project-data-catalog:root", "prov:project-data-view:root"])
+    rel("rel:runtime-derived-from-truth", "derived_from", f"ks:project:{project_key}:runtime-projection", f"ks:project:{project_key}:goal-alignment", "accepted", ["prov:project-data-view:root"])
+    for req in [item for item in items if str(item.get("item_id", "")).startswith("ks:requirement:")]:
+        rel(f"rel:{req['item_id']}:supports-goal", "supports", str(req["item_id"]), goal_id, "accepted" if req.get("truth_status") == "governed" else "proposed", list(req.get("provenance_ids") or []))
+    for item in [row for row in items if str(row.get("item_id", "")).startswith("ks:promotion:")]:
+        if str(item.get("owner_project_key") or "") == project_key:
+            rel(
+                f"rel:{item['item_id']}:governs-goal",
+                "supports",
+                str(item["item_id"]),
+                goal_id,
+                "accepted" if item.get("truth_status") == "governed" else "proposed",
+                list(item.get("provenance_ids") or []),
+            )
+        rel(
+            f"rel:{item['item_id']}:catalog-entry",
+            "derived_from",
+            str(item["item_id"]),
+            f"ks:project:{project_key}:catalog-entry",
+            "accepted" if item.get("truth_status") == "governed" else "proposed",
+            list(item.get("provenance_ids") or []),
+        )
+    for item in items:
+        item["relationship_count"] = sum(1 for r in relationships if r["from_item_id"] == item["item_id"] or r["to_item_id"] == item["item_id"])
+
+    pending_proposals: list[dict[str, object]] = []
+    missing_count = int(coverage.get("missing_requirement_count") or 0)
+    if missing_count:
+        pending_proposals.append({
+            "proposal_id": f"prop:canonical-gap:{project_key}:goal-alignment",
+            "operation": "needs_evidence",
+            "workflow_state": "needs_evidence",
+            "target_item_ids": [f"ks:project:{project_key}:goal-alignment"],
+            "rationale": f"Canonical goal alignment reports {missing_count} missing requirements; WebUI remains review-only.",
+            "provenance_ids": ["prov:project-data-view:goal-alignment"],
+            "created_by": "canonical_truth_read_model",
+            "created_at": generated_at,
+            "governance_ref": None,
+        })
+    for promotion_item in [row for row in items if str(row.get("item_id", "")).startswith("ks:promotion:")]:
+        if promotion_item.get("has_pending_change") is True:
+            pending_proposals.append({
+                "proposal_id": f"prop:{promotion_item['item_id']}",
+                "operation": "promotion_followup",
+                "workflow_state": "under_review",
+                "target_item_ids": [promotion_item["item_id"]],
+                "rationale": promotion_item.get("summary") or "Promotion candidate still requires governance completion.",
+                "provenance_ids": list(promotion_item.get("provenance_ids") or []),
+                "created_by": "canonical_truth_read_model",
+                "created_at": generated_at,
+                "governance_ref": promotion_item["item_id"],
+            })
+
+    fresh = not errors and all(isinstance(payloads.get(k), dict) and payloads.get(k) for k in ("operator_status", "project_data_catalog", "project_data_view"))
+    degraded_reasons = [f"{key}:{value}" for key, value in errors.items()]
+    if not degraded_reasons and not pending_proposals:
+        degraded_reasons = []
+    capabilities = {
+        "can_create_proposal": False,
+        "can_view_provenance": True,
+        "can_submit_for_promotion": False,
+        "degraded_notice": (
+            "Canonical truth read model loaded from OntoSynth artifacts; proposal submission and accepted-truth mutation remain disabled in 8787."
+            if fresh else
+            "Canonical truth read model is degraded because one or more OntoSynth truth artifacts are missing/unreadable; unavailable fields are marked canonical_absence and writes fail closed."
+        ),
+        "write_boundary": "Proposal/review only; this WebUI reads canonical truth artifacts and exposes no accepted-truth mutation endpoint.",
+        "canonical_sources": [_knowledge_structure_source_uri(path) for path in (bundle.get("paths") or {}).values() if isinstance(path, Path)],
+    }
+    return {
+        "project_key": project_key,
+        "generated_at": generated_at,
+        "freshness": {
+            "index_status": "fresh" if fresh else "unavailable",
+            "index_build_id": "canonical-truth-artifact-read-model-v1",
+            "governed_store_status": "fresh" if fresh else "unavailable",
+            "proposal_store_status": "unavailable",
+            "evidence_status": "fresh" if fresh else "unavailable",
+            "canonical_source_status": "ready" if fresh else "degraded",
+            "degraded_reasons": degraded_reasons,
+        },
+        "filters": {
+            "lifecycle": ["all", "candidate", "proposed", "accepted", "rejected", "superseded", "merged", "split", "refactored"],
+            "item_type": ["all", "goal_contract", "fact_projection", "coverage_report", "requirement", "runtime_projection", "catalog_entry", "promotion_candidate", "canonical_absence"],
+            "truth_status": ["all", "governed", "proposal_overlay", "derived_index", "runtime_evidence_only", "canonical_absence"],
+            "relationship_kind": ["all", "depends_on", "supports", "supported_by", "contradicts", "duplicates", "supersedes", "derived_from", "part_of"],
+            "proposal_state": ["all", "draft", "submitted", "needs_evidence", "under_review", "approved_for_promotion", "applied", "rejected", "withdrawn"],
+            "freshness_state": ["all", "fresh", "stale", "rebuilding", "unavailable", "canonical_absence"],
+            "distillation_category": ["all"] + sorted({str(item.get("distillation_category") or "none") for item in items}),
+            "distillation_scope": ["all"] + sorted({str(item.get("distillation_scope") or "none") for item in items}),
+            "governance_decision": ["all"] + sorted({str(item.get("governance_decision") or "unknown") for item in items}),
+        },
+        "items": items,
+        "selected_item": None,
+        "pending_proposals": pending_proposals,
+        "capabilities": capabilities,
+        "provenance_index": provenance_by_id,
+        "relationships": relationships,
+    }
+
+
+def _knowledge_structure_detail(item_id: str, project_key: str = "knowledge_governance_console") -> dict[str, object] | None:
+    model = _knowledge_structure_build_model(project_key)
+    item = next((row for row in model["items"] if str(row.get("item_id")) == str(item_id)), None)
+    if not item:
+        return None
+    provenance_index = model.get("provenance_index") if isinstance(model.get("provenance_index"), dict) else {}
+    provenance = [provenance_index[pid] for pid in item.get("provenance_ids", []) if pid in provenance_index]
+    relationships = [
+        r for r in model.get("relationships", [])
+        if r.get("from_item_id") == item_id or r.get("to_item_id") == item_id
+    ]
+    proposals = [p for p in model["pending_proposals"] if item_id in p.get("target_item_ids", [])]
+    lifecycle = str(item.get("lifecycle") or "candidate")
+    return {
+        "item": item,
+        "body": item.get("summary") or "Canonical body is absent from the projected truth artifacts.",
+        "versions": [
+            {"version_id": "canonical_projection", "state": "projected", "created_at": model["generated_at"]},
+            {"version_id": lifecycle, "state": lifecycle, "created_at": model["generated_at"]},
+        ],
+        "provenance": provenance,
+        "relationships": relationships,
+        "proposals": proposals,
+        "promotion_history": item.get("governance_chain") or [
+            {"decision_id": "canonical_absence", "state": "not_projected", "decided_at": None, "actor": "canonical truth read model"}
+        ],
+        "canonical_absence": item.get("canonical_absence", []),
+        "governance_chain": item.get("governance_chain", []),
+        "write_boundary": {
+            "mode": "proposal_only",
+            "notice": "You are viewing canonical truth artifact data. Edits create proposals only; this API exposes no direct accepted-truth mutation route.",
+            "accepted_truth_mutation_allowed": False,
+        },
+        "freshness": model.get("freshness", {}),
+    }
+
+
+def _handle_knowledge_structure_get(handler, parsed) -> bool:
+    qs = parse_qs(parsed.query)
+    project_key = qs.get("project_key", ["knowledge_governance_console"])[0] or "knowledge_governance_console"
+    prefix = "/api/knowledge-structure"
+    if parsed.path == f"{prefix}/model":
+        model = _knowledge_structure_build_model(project_key)
+        selected = qs.get("selected_item", [""])[0]
+        if selected:
+            model["selected_item"] = _knowledge_structure_detail(selected, project_key)
+        model.pop("provenance_index", None)
+        return j(handler, model)
+    m = re.match(r"^/api/knowledge-structure/items/([^/]+)(?:/(provenance|relationships))?$", parsed.path)
+    if m:
+        from urllib.parse import unquote
+        detail = _knowledge_structure_detail(unquote(m.group(1)), project_key)
+        if not detail:
+            return bad(handler, "Knowledge item not found", status=404)
+        sub = m.group(2)
+        if sub == "provenance":
+            return j(handler, {"item_id": detail["item"]["item_id"], "provenance": detail["provenance"], "freshness": detail.get("freshness", {})})
+        if sub == "relationships":
+            return j(handler, {"item_id": detail["item"]["item_id"], "relationships": detail["relationships"], "freshness": detail.get("freshness", {})})
+        return j(handler, detail)
+    if parsed.path == f"{prefix}/proposals":
+        model = _knowledge_structure_build_model(project_key)
+        return j(handler, {"project_key": project_key, "proposals": model["pending_proposals"], "capabilities": model["capabilities"], "freshness": model["freshness"]})
+    return False
+
 def _build_ontosynth_skills_overview() -> dict[str, object]:
     payload = _ontosynth_webui_profile_scope() or {}
     project_key = str(payload.get("project_key") or "").strip()
@@ -3415,6 +4040,12 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/insights":
         return _handle_insights(handler, parsed)
 
+    if parsed.path.startswith("/api/knowledge-structure"):
+        result = _handle_knowledge_structure_get(handler, parsed)
+        if result is False:
+            return bad(handler, "unknown Knowledge Structure endpoint", status=404)
+        return True
+
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_get
 
@@ -4400,6 +5031,13 @@ def handle_post(handler, parsed) -> bool:
         from api.session_recovery import repair_safe_session_recovery
         result = repair_safe_session_recovery(SESSION_DIR, state_db_path=_active_state_db_path())
         return j(handler, result, status=200 if result.get("clean") else 409)
+
+    if parsed.path.startswith("/api/knowledge-structure"):
+        return bad(
+            handler,
+            "Knowledge Structure writes are proposal/review-only and are disabled in this vertical slice; accepted truth cannot be mutated here.",
+            status=423,
+        ) or True
 
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_post

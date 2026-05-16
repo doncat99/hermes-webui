@@ -529,6 +529,7 @@ const LOCALES = {
     tab_workspaces: 'Spaces',
     tab_profiles: 'Profiles',
     tab_kanban: 'Kanban',
+    tab_knowledge_structure: 'Knowledge Structure',
     kanban_board: 'Board',
     kanban_visible_tasks: '{0} visible tasks',
     kanban_search_tasks: 'Search tasks',
@@ -662,6 +663,8 @@ const LOCALES = {
 
     // Insights
     insights_title: 'Usage Analytics',
+    knowledge_structure_title: 'Knowledge Structure',
+    knowledge_structure_meta: 'Browse learned knowledge, inspect provenance and relationships, and stage proposal-only changes.',
     insights_sessions: 'Sessions',
     insights_messages: 'Messages',
     insights_tokens: 'Tokens',

@@ -28,17 +28,71 @@ let _workspaceMode = 'empty'; // 'empty' | 'read' | 'create' | 'edit'
 let _workspacePreFormDetail = null;
 let _currentProfileDetail = null; // full profile object
 let _profileMode = 'empty'; // 'empty' | 'read' | 'create'
+let _knowledgeStructureModel = null;
+let _knowledgeStructureSelectedItemId = null;
+let _knowledgeStructureContextPivot = 'all';
+let _knowledgeStructureFilterState = {
+  lifecycle: 'all',
+  item_type: 'all',
+  truth_status: 'all',
+  distillation_category: 'all',
+  distillation_scope: 'all',
+  governance_decision: 'all',
+};
 let _profilePreFormDetail = null;
 let _pendingSettingsTargetPanel = null; // destination selected while settings had unsaved changes
 let _logsAutoRefreshTimer = null;
 let _lastLogsLines = [];
 let _logsSeverityFilter = 'all';
+const _panelRefreshStates = Object.create(null);
+
+function _panelRefreshState(key) {
+  if (!_panelRefreshStates[key]) {
+    _panelRefreshStates[key] = {
+      mounted: false,
+      loadingInitial: false,
+      refreshInFlight: false,
+      refreshQueued: false,
+      selectedId: '',
+      filters: {},
+      cachedStaticMeta: null,
+      currentModel: null,
+      lastArgs: null,
+    };
+  }
+  return _panelRefreshStates[key];
+}
+
+async function _runPanelRefresh(key, runner) {
+  const state = _panelRefreshState(key);
+  if (state.refreshInFlight) {
+    state.refreshQueued = true;
+    return false;
+  }
+  state.refreshInFlight = true;
+  try {
+    await runner(state);
+    return true;
+  } finally {
+    state.refreshInFlight = false;
+    if (state.refreshQueued) {
+      state.refreshQueued = false;
+      queueMicrotask(() => _runPanelRefresh(key, runner));
+    }
+  }
+}
+
+function _panelRememberSelection(state, selectedId) {
+  if (!state) return;
+  state.selectedId = selectedId || '';
+}
 
 // Map of panel names → i18n keys for the app titlebar label.
 const APP_TITLEBAR_KEYS = {
   chat: 'tab_chat', tasks: 'tab_tasks', skills: 'tab_skills',
   memory: 'tab_memory', workspaces: 'tab_workspaces',
-  profiles: 'tab_profiles', todos: 'tab_todos', insights: 'tab_insights', logs: 'tab_logs', settings: 'tab_settings',
+  profiles: 'tab_profiles', todos: 'tab_todos', insights: 'tab_insights',
+  knowledgeStructure: 'tab_knowledge_structure', logs: 'tab_logs', settings: 'tab_settings',
 };
 
 /**
@@ -227,7 +281,7 @@ async function switchPanel(name, opts = {}) {
   // showing-<name> class on <main>; no class means chat (the default).
   const mainEl = document.querySelector('main.main');
   if (mainEl) {
-    ['settings','skills','memory','tasks','kanban','workspaces','profiles','insights','logs'].forEach(p => {
+    ['settings','skills','memory','tasks','kanban','workspaces','profiles','insights','knowledgeStructure','logs'].forEach(p => {
       mainEl.classList.toggle('showing-' + p, nextPanel === p);
     });
   }
@@ -241,6 +295,7 @@ async function switchPanel(name, opts = {}) {
   if (nextPanel === 'profiles') await loadProfilesPanel();
   if (nextPanel === 'todos') loadTodos();
   if (nextPanel === 'insights') await loadInsights();
+  if (nextPanel === 'knowledgeStructure') { await mountKnowledgeStructurePanel(); await loadKnowledgeStructure(); }
   if (nextPanel === 'logs') await loadLogs();
   _syncLogsAutoRefresh();
   if (typeof _syncSystemHealthMonitorVisibility === 'function') _syncSystemHealthMonitorVisibility();
@@ -2846,6 +2901,322 @@ function _formatLlmWikiTimestamp(value) {
   if (!value) return 'Never';
   try { return new Date(value).toLocaleString(); }
   catch (_) { return String(value); }
+}
+
+
+// ── OntoSynth Knowledge Structure panel ──
+async function mountKnowledgeStructurePanel() {
+  const state = _panelRefreshState('knowledgeStructure');
+  if (state.mounted) return;
+  state.mounted = true;
+  _panelRememberSelection(state, _knowledgeStructureSelectedItemId || '');
+}
+
+async function loadKnowledgeStructureData(mode) {
+  return await api('/api/knowledge-structure/model?project_key=knowledge_governance_console');
+}
+
+async function patchKnowledgeStructureView(prev, next, mode) {
+  _knowledgeStructureModel = next;
+  const items = Array.isArray(next.items) ? next.items : [];
+  if (!_knowledgeStructureSelectedItemId && items.length) _knowledgeStructureSelectedItemId = items[0].item_id;
+  if (_knowledgeStructureSelectedItemId && !items.some(item => item.item_id === _knowledgeStructureSelectedItemId)) {
+    _knowledgeStructureSelectedItemId = items[0] ? items[0].item_id : null;
+  }
+  await _renderKnowledgeStructure(next);
+}
+
+async function loadKnowledgeStructure(animate) {
+  const box = $('knowledgeStructureContent');
+  const knowledgeStructureSidebar = $('knowledgeStructureSidebar');
+  const list = $('knowledgeStructureList');
+  const refreshBtn = $('knowledgeStructureRefreshBtn');
+  if (!box) return;
+  await mountKnowledgeStructurePanel();
+  const state = _panelRefreshState('knowledgeStructure');
+  const mode = animate ? 'foreground' : (state.currentModel ? 'background' : 'mount');
+  if (animate && refreshBtn) { refreshBtn.disabled = true; refreshBtn.style.opacity = '0.5'; }
+  try {
+    if (mode === 'mount') {
+      if (list) list.innerHTML = `<div class="knowledge-structure-loading">${esc(t('loading'))}</div>`;
+      if (knowledgeStructureSidebar) knowledgeStructureSidebar.innerHTML = `<div class="knowledge-structure-loading">${esc(t('loading'))}</div>`;
+    }
+    await _runPanelRefresh('knowledgeStructure', async (panelState) => {
+      panelState.lastArgs = { animate: !!animate };
+      const next = await loadKnowledgeStructureData(mode);
+      await patchKnowledgeStructureView(panelState.currentModel, next, mode);
+      panelState.currentModel = next;
+      _panelRememberSelection(panelState, _knowledgeStructureSelectedItemId || '');
+    });
+  } catch (e) {
+    box.innerHTML = `<div class="knowledge-structure-error" role="alert">${esc(t('error_prefix') + e.message)}</div>`;
+    if (knowledgeStructureSidebar) knowledgeStructureSidebar.innerHTML = `<div class="knowledge-structure-error" role="alert">${esc(t('error_prefix') + e.message)}</div>`;
+  } finally {
+    if (animate && refreshBtn) { refreshBtn.disabled = false; refreshBtn.style.opacity = ''; }
+  }
+}
+
+function _knowledgeFreshnessBadge(freshness) {
+  const sourceStatus = freshness && (freshness.canonical_source_status || freshness.governed_store_status);
+  const requiredValues = [
+    freshness && freshness.index_status,
+    sourceStatus,
+    freshness && freshness.evidence_status,
+  ].filter(Boolean);
+  const degradedReasons = Array.isArray(freshness && freshness.degraded_reasons) ? freshness.degraded_reasons : [];
+  if (!requiredValues.length) return {cls:'warn', text:'unavailable'};
+  if (sourceStatus === 'degraded' || degradedReasons.length || requiredValues.includes('unavailable')) {
+    return {cls:'err', text:'degraded'};
+  }
+  if (requiredValues.includes('stale') || requiredValues.includes('rebuilding')) {
+    return {cls:'warn', text:requiredValues.includes('stale') ? 'stale' : 'rebuilding'};
+  }
+  return {cls:'ok', text:'fresh'};
+}
+
+function _knowledgeStructureContextPivots(items) {
+  const count = (predicate) => items.filter(predicate).length;
+  return [
+    {key:'all', label:'All knowledge', note:'Every projected governed, proposal, and runtime row', filters:{}, count:items.length},
+    {key:'accepted', label:'Accepted governed truth', note:'Read-only accepted knowledge from governed truth', filters:{lifecycle:'accepted', truth_status:'governed'}, count:count(item => item.lifecycle === 'accepted' && item.truth_status === 'governed')},
+    {key:'proposal_overlay', label:'Proposal overlay', note:'Pending or proposal-backed changes over governed truth', filters:{truth_status:'proposal_overlay'}, count:count(item => item.truth_status === 'proposal_overlay' || item.has_pending_change)},
+    {key:'promotion_accountability', label:'Promotion accountability', note:'Rows carrying governance decision and responsibility-chain signals', filters:{}, count:count(item => Array.isArray(item.governance_chain) && item.governance_chain.length)},
+    {key:'canonical_absence', label:'Canonical absence', note:'Projected fields with explicit canonical absence', filters:{}, count:count(item => Array.isArray(item.canonical_absence) && item.canonical_absence.length)},
+    {key:'runtime_evidence', label:'Runtime evidence only', note:'Execution evidence without accepted governed truth', filters:{truth_status:'runtime_evidence_only'}, count:count(item => item.truth_status === 'runtime_evidence_only')},
+    {key:'platform_reusable', label:'Platform reusable', note:'Distilled knowledge reusable beyond this project', filters:{distillation_category:'platform_reusable'}, count:count(item => item.distillation_category === 'platform_reusable')},
+    {key:'project_learning', label:'Project learning', note:'Project-scoped learning and decisions', filters:{distillation_category:'project_learning'}, count:count(item => item.distillation_category === 'project_learning')},
+    {key:'anti_pattern', label:'Anti-patterns', note:'Recorded pitfalls and avoided practices', filters:{distillation_category:'anti_pattern'}, count:count(item => item.distillation_category === 'anti_pattern')},
+  ];
+}
+
+function _knowledgeStructureActiveContextPivot(items) {
+  const pivots = _knowledgeStructureContextPivots(items);
+  return pivots.find(pivot => pivot.key === _knowledgeStructureContextPivot) || pivots[0];
+}
+
+function _renderKnowledgeStructureContextRail(data, items, stats, badge) {
+  const capabilities = data.capabilities || {};
+  const freshness = data.freshness || {};
+  const pivots = _knowledgeStructureContextPivots(items);
+  const sources = Array.isArray(capabilities.canonical_sources) ? capabilities.canonical_sources : [];
+  return `<aside class="knowledge-structure-context-rail" aria-label="Knowledge Structure context and scope">
+    <div class="knowledge-structure-section-title">Context and Scope</div>
+    <div class="knowledge-structure-scope-card">
+      <strong>${esc(data.project_key || 'unknown project')}</strong>
+      <span class="knowledge-structure-status ${badge.cls}">${esc(badge.text)}</span>
+      <small>generated ${esc(_formatLlmWikiTimestamp(data.generated_at))}</small>
+    </div>
+    <div class="knowledge-structure-section-title">Scope pivots</div>
+    <div class="knowledge-structure-context-list" role="list" aria-label="Knowledge scope pivots">
+      ${pivots.map(pivot => `<button type="button" class="knowledge-structure-context-item ${pivot.key === _knowledgeStructureContextPivot ? 'active' : ''}" onclick="setKnowledgeStructureContextPivot('${esc(pivot.key)}')" aria-pressed="${pivot.key === _knowledgeStructureContextPivot ? 'true' : 'false'}">
+        <span><strong>${esc(pivot.label)}</strong><small>${esc(pivot.note)}</small></span>
+        <code>${esc(String(pivot.count))}</code>
+      </button>`).join('')}
+    </div>
+    <div class="knowledge-structure-section-title">Source health</div>
+    <div class="knowledge-structure-source-health" aria-label="Knowledge source freshness">
+      <span>index <strong>${esc(freshness.index_status || 'unavailable')}</strong></span>
+      <span>truth <strong>${esc(freshness.canonical_source_status || freshness.governed_store_status || 'unavailable')}</strong></span>
+      <span>evidence <strong>${esc(freshness.evidence_status || 'unavailable')}</strong></span>
+      <span>proposal store <strong>${esc(freshness.proposal_store_status || 'unavailable')}</strong></span>
+    </div>
+    ${sources.length ? `<div class="knowledge-structure-source-list" aria-label="Canonical source context">${sources.slice(0, 4).map(src => `<code>${esc(src)}</code>`).join('')}</div>` : ''}
+    <div class="knowledge-structure-boundary small">${esc(capabilities.write_boundary || 'Accepted truth is read-only; proposal writes fail closed in this view.')}</div>
+  </aside>`;
+}
+
+function _renderKnowledgeStructureFilters(data) {
+  return `<section class="knowledge-structure-filters" aria-label="Knowledge filters">
+    <div class="knowledge-structure-section-title">Browse filters</div>
+    ${['lifecycle','item_type','truth_status','distillation_category','distillation_scope','governance_decision'].map(key => {
+      const values = (data.filters && data.filters[key]) || [];
+      return `<label>${esc(key.replace(/_/g, ' '))}<select onchange="setKnowledgeStructureFilter('${esc(key)}', this.value)">${values.map(value => `<option value="${esc(String(value))}" ${_knowledgeStructureFilterState[key] === value ? 'selected' : ''}>${esc(String(value))}</option>`).join('')}</select></label>`;
+    }).join('')}
+    <div class="knowledge-structure-boundary small">Filter wiring is read-model only; refresh does not write truth. Active filters affect browse/inspect only.</div>
+  </section>`;
+}
+
+function _renderKnowledgeItemRow(item) {
+  const selected = item.item_id === _knowledgeStructureSelectedItemId;
+  const lifecycle = item.lifecycle || 'unknown';
+  const truth = item.truth_status || 'runtime_evidence_only';
+  const distillationCategory = item.distillation_category || 'none';
+  const distillationScope = item.distillation_scope || 'none';
+  return `<button type="button" class="knowledge-structure-row ${selected ? 'active' : ''}" onclick="selectKnowledgeStructureItem('${esc(String(item.item_id || ''))}')" aria-pressed="${selected ? 'true' : 'false'}">
+    <span class="knowledge-structure-row-main">
+      <strong>${esc(item.title || item.item_id || 'Untitled knowledge')}</strong>
+      <span>${esc(item.summary || 'No summary available.')}</span>
+      <code>${esc(item.item_id || '')}</code>
+    </span>
+    <span class="knowledge-structure-row-meta">
+      <span>${esc(item.item_type || 'item')}</span>
+      <span class="knowledge-structure-pill">${esc(lifecycle)}</span>
+      <span class="knowledge-structure-pill ${truth === 'governed' ? 'ok' : 'warn'}">${esc(truth)}</span>
+      <span>${esc(distillationCategory)} / ${esc(distillationScope)}</span>
+      <span>${Number(item.source_count || 0)} evidence · ${Number(item.relationship_count || 0)} relations</span>
+      <span>${Array.isArray(item.governance_chain) && item.governance_chain.length ? 'governance chain visible' : 'governance chain: canonical absence'}</span>
+      <span>${Array.isArray(item.canonical_absence) && item.canonical_absence.length ? 'canonical absence noted' : (item.has_pending_change ? 'proposal active' : 'no proposal')}</span>
+    </span>
+  </button>`;
+}
+
+async function selectKnowledgeStructureItem(itemId) {
+  _knowledgeStructureSelectedItemId = itemId;
+  _panelRememberSelection(_panelRefreshState('knowledgeStructure'), itemId);
+  const detail = $('knowledgeStructureDetail');
+  if (detail) detail.innerHTML = `<div class="knowledge-structure-loading">${esc(t('loading'))}</div>`;
+  await _renderKnowledgeStructure(_knowledgeStructureModel || {});
+}
+
+async function _loadKnowledgeStructureDetail(itemId) {
+  if (!itemId) return null;
+  try { return await api(`/api/knowledge-structure/items/${encodeURIComponent(itemId)}?project_key=knowledge_governance_console`); }
+  catch (e) { return {error: e.message || String(e)}; }
+}
+
+async function _renderKnowledgeStructure(data) {
+  const box = $('knowledgeStructureContent');
+  const knowledgeStructureSidebar = $('knowledgeStructureSidebar');
+  if (!box) return;
+  const items = Array.isArray(data.items) ? data.items : [];
+  const proposals = Array.isArray(data.pending_proposals) ? data.pending_proposals : [];
+  const freshness = data.freshness || {};
+  const capabilities = data.capabilities || {};
+  const badge = _knowledgeFreshnessBadge(freshness);
+  const activePivot = _knowledgeStructureActiveContextPivot(items);
+  const filteredItems = _filterKnowledgeStructureItems(items, activePivot);
+  let selectedId = _knowledgeStructureSelectedItemId || (filteredItems[0] && filteredItems[0].item_id) || '';
+  if (selectedId && !filteredItems.some(item => item.item_id === selectedId)) {
+    selectedId = filteredItems[0] ? filteredItems[0].item_id : null;
+    _knowledgeStructureSelectedItemId = selectedId;
+  }
+  const stats = _knowledgeStructureStats(items);
+  const detail = await _loadKnowledgeStructureDetail(selectedId);
+  if (knowledgeStructureSidebar) {
+    knowledgeStructureSidebar.innerHTML = `
+      ${_renderKnowledgeStructureContextRail(data, items, stats, badge)}
+      ${_renderKnowledgeStructureFilters(data)}
+    `;
+  }
+  box.innerHTML = `
+    <section class="knowledge-structure-shell" aria-label="Knowledge Structure workbench">
+      <header class="knowledge-structure-header">
+        <div>
+          <div class="knowledge-structure-title">Knowledge Structure</div>
+          <div class="knowledge-structure-sub">Project ${esc(data.project_key || 'unknown')} · generated ${esc(_formatLlmWikiTimestamp(data.generated_at))}</div>
+          <div class="knowledge-structure-boundary">Proposal edits do not mutate governed truth. Accepted knowledge is read-only here.</div>
+        </div>
+        <div class="knowledge-structure-status-stack" aria-label="freshness and proposal status">
+          <span class="knowledge-structure-status ${badge.cls}">${esc(badge.text)}</span>
+          <span>${proposals.length} proposal activities</span>
+          <span>index ${esc(freshness.index_status || 'unavailable')}${freshness.index_build_id ? ' · ' + esc(freshness.index_build_id) : ''}</span>
+          <span>truth ${esc(freshness.canonical_source_status || freshness.governed_store_status || 'unavailable')}</span>
+        </div>
+      </header>
+      ${capabilities.degraded_notice ? `<div class="knowledge-structure-degraded" role="status">${esc(capabilities.degraded_notice)}</div>` : ''}
+      ${Array.isArray(capabilities.canonical_sources) && capabilities.canonical_sources.length ? `<div class="knowledge-structure-sources" aria-label="Canonical truth sources"><strong>Canonical truth sources</strong>${capabilities.canonical_sources.map(src => `<code>${esc(src)}</code>`).join('')}</div>` : ''}
+      <div class="knowledge-structure-sources" aria-label="Knowledge governance classification summary"><strong>Classification</strong><code>platform_reusable ${esc(String(stats.platform_reusable))}</code><code>project_learning ${esc(String(stats.project_learning))}</code><code>anti_pattern ${esc(String(stats.anti_pattern))}</code><code>proposal_overlay ${esc(String(stats.pending))}</code></div>
+      <div class="knowledge-structure-workbench">
+        <div class="knowledge-structure-grid">
+          <section class="knowledge-structure-browser" aria-label="Knowledge item browser">
+            <div class="knowledge-structure-section-title">Browse learned knowledge (${filteredItems.length}/${items.length})</div>
+            <div class="knowledge-structure-active-scope" aria-label="Active knowledge scope"><strong>${esc(activePivot.label)}</strong><span>${esc(activePivot.note)}</span><button type="button" onclick="setKnowledgeStructureContextPivot('all')" ${activePivot.key === 'all' ? 'disabled' : ''}>All knowledge</button></div>
+            <div id="knowledgeStructureList" class="knowledge-structure-list" role="listbox" aria-label="Knowledge items">
+              ${filteredItems.length ? filteredItems.map(_renderKnowledgeItemRow).join('') : '<div class="knowledge-structure-empty">No items match the active governance filters.</div>'}
+            </div>
+          </section>
+          <section id="knowledgeStructureDetail" class="knowledge-structure-inspector" aria-label="Knowledge item inspector">
+            ${_renderKnowledgeStructureDetail(detail)}
+          </section>
+        </div>
+      </div>
+      <footer class="knowledge-structure-proposal-rail" aria-label="Proposal activity">
+        <strong>Proposal draft / review lane</strong>
+        <span>${capabilities.can_create_proposal ? 'Proposal drafting available' : 'Proposal drafting disabled: proposal/evidence/governance dependency unavailable'}</span>
+        <span>${capabilities.can_submit_for_promotion ? 'Submit for review available' : 'Submit for promotion review disabled'}</span>
+        <button type="button" disabled title="Proposal endpoint is fail-closed in this vertical slice">New proposal (review only)</button>
+      </footer>
+    </section>`;
+}
+
+function _knowledgeStructureMatchesPivot(item, pivot) {
+  if (!pivot || !pivot.key || pivot.key === 'all') return true;
+  if (pivot.key === 'proposal_overlay') return item.truth_status === 'proposal_overlay' || item.has_pending_change;
+  if (pivot.key === 'promotion_accountability') return Array.isArray(item.governance_chain) && item.governance_chain.length;
+  if (pivot.key === 'canonical_absence') return Array.isArray(item.canonical_absence) && item.canonical_absence.length;
+  return Object.entries(pivot.filters || {}).every(([key, value]) => String(item[key] || 'unknown') === String(value));
+}
+
+function _filterKnowledgeStructureItems(items, pivot) {
+  return items.filter(item => {
+    if (!_knowledgeStructureMatchesPivot(item, pivot)) return false;
+    return Object.entries(_knowledgeStructureFilterState).every(([key, value]) => {
+      if (!value || value === 'all') return true;
+      return String(item[key] || 'unknown') === String(value);
+    });
+  });
+}
+
+function _knowledgeStructureStats(items) {
+  return items.reduce((acc, item) => {
+    const category = String(item.distillation_category || 'none');
+    if (category === 'platform_reusable') acc.platform_reusable += 1;
+    else if (category === 'project_learning') acc.project_learning += 1;
+    else if (category === 'anti_pattern') acc.anti_pattern += 1;
+    if (item.truth_status === 'proposal_overlay' || item.has_pending_change) acc.pending += 1;
+    return acc;
+  }, { platform_reusable: 0, project_learning: 0, anti_pattern: 0, pending: 0 });
+}
+
+async function setKnowledgeStructureContextPivot(key) {
+  _knowledgeStructureContextPivot = key || 'all';
+  await _renderKnowledgeStructure(_knowledgeStructureModel || {});
+}
+
+async function setKnowledgeStructureFilter(key, value) {
+  _knowledgeStructureFilterState[key] = value;
+  await _renderKnowledgeStructure(_knowledgeStructureModel || {});
+}
+
+
+function _renderKnowledgeStructureDetail(detail) {
+  if (!detail) return '<div class="knowledge-structure-empty">Select an item to inspect provenance, relationships, lifecycle, and proposals.</div>';
+  if (detail.error) return `<div class="knowledge-structure-error" role="alert">${esc(detail.error)}</div>`;
+  const item = detail.item || {};
+  const provenance = Array.isArray(detail.provenance) ? detail.provenance : [];
+  const relationships = Array.isArray(detail.relationships) ? detail.relationships : [];
+  const proposals = Array.isArray(detail.proposals) ? detail.proposals : [];
+  const versions = Array.isArray(detail.versions) ? detail.versions : [];
+  const history = Array.isArray(detail.promotion_history) ? detail.promotion_history : [];
+  return `
+    <div class="knowledge-structure-section-title">Inspect</div>
+    <h3>${esc(item.title || item.item_id || 'Knowledge item')}</h3>
+    <code>${esc(item.item_id || '')}</code>
+    <p>${esc(detail.body || item.summary || 'No body available.')}</p>
+    <div class="knowledge-structure-detail-grid">
+      <div><span>Lifecycle</span><strong>${esc(item.lifecycle || 'unknown')}</strong></div>
+      <div><span>Truth status</span><strong>${esc(item.truth_status || 'runtime_evidence_only')}</strong></div>
+      <div><span>Distillation</span><strong>${esc(item.distillation_category || 'none')} / ${esc(item.distillation_scope || 'none')}</strong></div>
+      <div><span>Proposed by</span><strong>${esc(item.proposed_by || 'unknown')}</strong></div>
+      <div><span>Confidence</span><strong>${item.confidence == null ? 'unknown' : esc(String(item.confidence))}</strong></div>
+      <div><span>Updated</span><strong>${esc(_formatLlmWikiTimestamp(item.updated_at))}</strong></div>
+    </div>
+    <div class="knowledge-structure-boundary">${esc((detail.write_boundary && detail.write_boundary.notice) || 'You are viewing governed/read-model data. Edits create proposals only.')}</div>
+    <div class="knowledge-structure-section-title">Canonical absence</div>
+    ${Array.isArray(detail.canonical_absence) && detail.canonical_absence.length ? detail.canonical_absence.map(a => `<div class="knowledge-structure-absence"><strong>${esc(a.field || 'field')}</strong><span>${esc(a.reason || 'canonical absence')}</span></div>`).join('') : '<div class="knowledge-structure-empty">No canonical absence recorded for projected UI fields.</div>'}
+    <div class="knowledge-structure-section-title">Governance chain</div>
+    ${Array.isArray(detail.governance_chain) && detail.governance_chain.length ? detail.governance_chain.map(g => `<div class="knowledge-structure-governance"><strong>${esc(g.chain_id || 'governance decision')}</strong><span>${esc(g.decision || 'unknown')} · ${esc(g.actual_decider || 'canonical_absence')} · ${esc(g.application_status || 'canonical_absence')} / ${esc(g.write_back_status || 'canonical_absence')}</span>${Array.isArray(g.allowed_approvers) && g.allowed_approvers.length ? `<small>allowed approvers: ${esc(g.allowed_approvers.join(', '))}</small>` : ''}</div>`).join('') : '<div class="knowledge-structure-empty">Governance chain not projected for this item; accepted-truth mutation remains disabled.</div>'}
+    <div class="knowledge-structure-section-title">Provenance & evidence</div>
+    ${provenance.map(p => `<div class="knowledge-structure-evidence"><strong>${esc(p.source_kind || 'source')}</strong><span>${esc(p.source_uri || '')}${p.json_pointer ? ' · ' + esc(p.json_pointer) : ''}</span><p>${esc(p.excerpt || 'No excerpt available.')}</p><small>${esc(p.trust_level || 'unverified')} · ${esc(_formatLlmWikiTimestamp(p.captured_at))}</small></div>`).join('') || '<div class="knowledge-structure-empty">Provenance unavailable; proposal submission remains disabled.</div>'}
+    <div class="knowledge-structure-section-title">Relationships / lineage</div>
+    ${relationships.map(r => `<div class="knowledge-structure-relation"><span>${esc(r.kind || 'related')}</span><strong>${esc(r.from_item_id || '')} → ${esc(r.to_item_id || '')}</strong><small>${esc(r.status || 'unknown')} · evidence ${esc((r.provenance_ids || []).join(', ') || 'missing')}</small></div>`).join('') || '<div class="knowledge-structure-empty">No relationships in current read model.</div>'}
+    <div class="knowledge-structure-section-title">Proposal activity</div>
+    ${proposals.map(p => `<div class="knowledge-structure-proposal"><strong>${esc(p.operation || 'proposal')} · ${esc(p.workflow_state || 'draft')}</strong><span>${esc(p.proposal_id || '')}</span><p>${esc(p.rationale || 'No rationale recorded.')}</p></div>`).join('') || '<div class="knowledge-structure-empty">No active proposal for this item.</div>'}
+    <div class="knowledge-structure-section-title">Lifecycle timeline</div>
+    <div class="knowledge-structure-lineage">${versions.map(v => `<span>${esc(v.version_id || v.state || 'version')}</span>`).join(' → ') || 'candidate'}${history.length ? ' → external governance decision' : ''}</div>
+    <div class="knowledge-structure-actions" aria-label="Allowed proposal actions">
+      <button type="button" disabled>Propose edit</button><button type="button" disabled>Propose deprecation</button><button type="button" disabled>Propose merge/split/refactor</button>
+    </div>`;
 }
 
 function _renderSystemHealthPanel() {
